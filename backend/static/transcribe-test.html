@@ -1,0 +1,483 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Whisper Local en Vivo</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7f5;
+      --panel: #ffffff;
+      --text: #171b21;
+      --muted: #647080;
+      --line: #d9ded8;
+      --accent: #0f766e;
+      --accent-dark: #115e59;
+      --danger: #b42318;
+      --soft: #eef7f5;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+
+    main {
+      width: min(860px, calc(100vw - 28px));
+      margin: 0 auto;
+      padding: 24px 0;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      padding-bottom: 16px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 24px;
+      line-height: 1.2;
+      letter-spacing: 0;
+    }
+
+    .status {
+      min-width: 132px;
+      padding: 8px 10px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--panel);
+      color: var(--muted);
+      text-align: center;
+      font-size: 14px;
+      white-space: nowrap;
+    }
+
+    .status.active {
+      border-color: var(--accent);
+      color: var(--accent-dark);
+      font-weight: 700;
+    }
+
+    .surface {
+      margin-top: 18px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      overflow: hidden;
+    }
+
+    .controls {
+      display: grid;
+      grid-template-columns: 1fr auto auto;
+      gap: 10px;
+      align-items: center;
+      padding: 14px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .meter {
+      height: 10px;
+      overflow: hidden;
+      border-radius: 999px;
+      background: #e7ebe6;
+    }
+
+    .meter span {
+      display: block;
+      width: 0%;
+      height: 100%;
+      background: var(--accent);
+      transition: width 80ms linear;
+    }
+
+    button {
+      min-height: 42px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fff;
+      color: var(--text);
+      font: inherit;
+      cursor: pointer;
+      padding: 0 14px;
+    }
+
+    button.primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+      font-weight: 700;
+    }
+
+    button.danger {
+      background: var(--danger);
+      border-color: var(--danger);
+      color: #fff;
+      font-weight: 700;
+    }
+
+    button:disabled {
+      cursor: not-allowed;
+      opacity: 0.55;
+    }
+
+    .result {
+      padding: 18px;
+      min-height: 260px;
+    }
+
+    .live-line {
+      min-height: 92px;
+      padding-bottom: 16px;
+      border-bottom: 1px solid var(--line);
+      margin-bottom: 16px;
+      font-size: 22px;
+      line-height: 1.45;
+    }
+
+    .final-text {
+      color: var(--text);
+    }
+
+    .empty {
+      color: var(--muted);
+    }
+
+    .entry {
+      border-bottom: 1px solid var(--line);
+      padding: 0 0 14px;
+      margin: 0 0 14px;
+    }
+
+    .entry:last-child {
+      border-bottom: 0;
+      margin-bottom: 0;
+      padding-bottom: 0;
+    }
+
+    .transcript {
+      margin: 0;
+      font-size: 20px;
+      line-height: 1.4;
+      white-space: pre-wrap;
+    }
+
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .pill {
+      padding: 4px 8px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--soft);
+    }
+
+    .error {
+      margin-top: 12px;
+      padding: 10px 12px;
+      border: 1px solid #f0b8b3;
+      border-radius: 6px;
+      background: #fff1f0;
+      color: var(--danger);
+      display: none;
+    }
+
+    @media (max-width: 680px) {
+      main { width: min(100vw - 20px, 860px); }
+      header {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+      .controls {
+        grid-template-columns: 1fr;
+      }
+      button { width: 100%; }
+      .transcript { font-size: 18px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Whisper local preciso</h1>
+      <div id="status" class="status">listo</div>
+    </header>
+
+    <section class="surface">
+      <div class="controls">
+        <div class="meter"><span id="level"></span></div>
+        <button id="recordButton" class="primary" type="button">Iniciar</button>
+        <button id="clearButton" type="button">Limpiar</button>
+      </div>
+      <div class="result">
+        <div class="live-line">
+          <span id="finalText" class="final-text"></span>
+        </div>
+        <div id="entries" class="empty">Sin transcripciones</div>
+        <div id="error" class="error"></div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const statusEl = document.querySelector("#status");
+    const levelEl = document.querySelector("#level");
+    const recordButton = document.querySelector("#recordButton");
+    const clearButton = document.querySelector("#clearButton");
+    const entriesEl = document.querySelector("#entries");
+    const errorEl = document.querySelector("#error");
+    const finalTextEl = document.querySelector("#finalText");
+
+    let stream = null;
+    let audioContext = null;
+    let source = null;
+    let workletNode = null;
+    let sinkNode = null;
+    let liveSocket = null;
+    let recording = false;
+    let sampleRate = 0;
+    let pendingSamples = [];
+
+    const targetSampleRate = 16000;
+    const frameSamples = 800;
+
+    function setStatus(text, active = false) {
+      statusEl.textContent = text;
+      statusEl.classList.toggle("active", active);
+    }
+
+    function setError(text) {
+      errorEl.style.display = text ? "block" : "none";
+      errorEl.textContent = text;
+    }
+
+    function updateControls() {
+      clearButton.disabled = recording;
+    }
+
+    async function startRecording() {
+      if (!window.AudioWorkletNode) {
+        setError("AudioWorklet no está disponible en este navegador.");
+        return;
+      }
+      setError("");
+      pendingSamples = [];
+      liveSocket = await connectLiveSocket();
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: {ideal: 1},
+          sampleRate: {ideal: 48000},
+          echoCancellation: true,
+          noiseSuppression: false,
+          autoGainControl: false
+        }
+      });
+      const [track] = stream.getAudioTracks();
+      if (track) console.log("mic settings", track.getSettings());
+      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+      audioContext = new AudioContextClass({sampleRate: targetSampleRate});
+      sampleRate = audioContext.sampleRate;
+      await audioContext.audioWorklet.addModule(workletModuleUrl());
+      source = audioContext.createMediaStreamSource(stream);
+      workletNode = new AudioWorkletNode(audioContext, "pcm-worklet");
+      sinkNode = audioContext.createGain();
+      sinkNode.gain.value = 0;
+      workletNode.port.onmessage = (event) => handleAudioFrame(event.data);
+      source.connect(workletNode);
+      workletNode.connect(sinkNode);
+      sinkNode.connect(audioContext.destination);
+      recording = true;
+      recordButton.textContent = "Detener";
+      recordButton.className = "danger";
+      setStatus("en vivo", true);
+      updateControls();
+    }
+
+    function stopRecording() {
+      if (!recording) return;
+      recording = false;
+      recordButton.textContent = "Iniciar";
+      recordButton.className = "primary";
+      flushPendingSamples();
+      if (liveSocket && liveSocket.readyState === WebSocket.OPEN) {
+        liveSocket.send(JSON.stringify({type: "stop"}));
+      }
+      cleanupAudio();
+      levelEl.style.width = "0%";
+      setStatus("listo");
+      updateControls();
+    }
+
+    function cleanupAudio() {
+      if (workletNode) workletNode.disconnect();
+      if (sinkNode) sinkNode.disconnect();
+      if (source) source.disconnect();
+      if (stream) stream.getTracks().forEach(track => track.stop());
+      if (audioContext) audioContext.close();
+      if (liveSocket && liveSocket.readyState === WebSocket.OPEN) liveSocket.close();
+      workletNode = null;
+      sinkNode = null;
+      source = null;
+      stream = null;
+      audioContext = null;
+      liveSocket = null;
+    }
+
+    function connectLiveSocket() {
+      return new Promise((resolve, reject) => {
+        const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+        const socket = new WebSocket(`${protocol}//${window.location.host}/api/transcribe/live`);
+        socket.binaryType = "arraybuffer";
+        socket.onopen = () => resolve(socket);
+        socket.onerror = () => reject(new Error("No pude abrir el WebSocket local."));
+        socket.onmessage = (event) => handleLiveEvent(JSON.parse(event.data));
+      });
+    }
+
+    function handleLiveEvent(event) {
+      if (event.type === "ready") {
+        setStatus("en vivo", true);
+      }
+      if (event.type === "error") {
+        setError(event.detail || "Error de transcripción.");
+        setStatus("error");
+      }
+      if (event.type === "transcript") {
+        finalTextEl.textContent = event.final_text || "";
+        if (event.inference_ms) addEntry(event.hypothesis || "", event.window_ms || 0, event);
+        setStatus(event.inference_ms ? `RTF ${event.rtf}` : "en vivo", true);
+      }
+    }
+
+    function addEntry(text, durationMs, data) {
+      if (entriesEl.classList.contains("empty")) {
+        entriesEl.className = "";
+        entriesEl.textContent = "";
+      }
+      const entry = document.createElement("article");
+      entry.className = "entry";
+      const transcript = document.createElement("p");
+      transcript.className = "transcript";
+      transcript.textContent = text || "(sin texto)";
+      const meta = document.createElement("div");
+      meta.className = "meta";
+      if (data.final) meta.append(metaPill("final"));
+      if (data.speculative) meta.append(metaPill("precalculated"));
+      meta.append(metaPill(`audio ${Math.round(durationMs / 100) / 10}s`));
+      if (Number.isFinite(data.delivery_ms)) meta.append(metaPill(`delivery ${data.delivery_ms}ms`));
+      meta.append(metaPill(`stt ${data.inference_ms || data.stt_ms || 0}ms`));
+      if (data.rtf) meta.append(metaPill(`rtf ${data.rtf}`));
+      entry.append(transcript, meta);
+      entriesEl.append(entry);
+    }
+
+    function metaPill(text) {
+      const span = document.createElement("span");
+      span.className = "pill";
+      span.textContent = text;
+      return span;
+    }
+
+    function handleAudioFrame(frame) {
+      if (!recording || !liveSocket || liveSocket.readyState !== WebSocket.OPEN) return;
+      const samples = resampleFrame(new Float32Array(frame), sampleRate, targetSampleRate);
+      levelEl.style.width = `${Math.min(100, Math.round(rms(samples) * 180))}%`;
+      for (let i = 0; i < samples.length; i++) {
+        pendingSamples.push(Math.max(-1, Math.min(1, samples[i])));
+      }
+      while (pendingSamples.length >= frameSamples) {
+        const slice = pendingSamples.splice(0, frameSamples);
+        liveSocket.send(floatToInt16Bytes(slice));
+      }
+    }
+
+    function flushPendingSamples() {
+      if (!pendingSamples.length || !liveSocket || liveSocket.readyState !== WebSocket.OPEN) return;
+      liveSocket.send(floatToInt16Bytes(pendingSamples.splice(0)));
+    }
+
+    function resampleFrame(input, inputRate, outputRate) {
+      if (inputRate === outputRate) return input;
+      const ratio = inputRate / outputRate;
+      const length = Math.floor(input.length / ratio);
+      const output = new Float32Array(length);
+      for (let i = 0; i < length; i++) {
+        const position = i * ratio;
+        const left = Math.floor(position);
+        const right = Math.min(input.length - 1, left + 1);
+        const weight = position - left;
+        output[i] = input[left] * (1 - weight) + input[right] * weight;
+      }
+      return output;
+    }
+
+    function floatToInt16Bytes(samples) {
+      const pcm = new Int16Array(samples.length);
+      for (let i = 0; i < samples.length; i++) {
+        const sample = Math.max(-1, Math.min(1, samples[i]));
+        pcm[i] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
+      }
+      return pcm.buffer;
+    }
+
+    function rms(samples) {
+      let sum = 0;
+      for (let i = 0; i < samples.length; i++) sum += samples[i] * samples[i];
+      return Math.sqrt(sum / Math.max(1, samples.length));
+    }
+
+    function workletModuleUrl() {
+      const code = `
+        class PcmWorklet extends AudioWorkletProcessor {
+          process(inputs) {
+            const channel = inputs[0] && inputs[0][0];
+            if (channel) {
+              const frame = new Float32Array(channel);
+              this.port.postMessage(frame.buffer, [frame.buffer]);
+            }
+            return true;
+          }
+        }
+        registerProcessor("pcm-worklet", PcmWorklet);
+      `;
+      return URL.createObjectURL(new Blob([code], {type: "application/javascript"}));
+    }
+
+    recordButton.addEventListener("click", () => {
+      if (recording) stopRecording();
+      else startRecording().catch((error) => {
+        setError(error.message);
+        setStatus("error");
+        cleanupAudio();
+        updateControls();
+      });
+    });
+
+    clearButton.addEventListener("click", () => {
+      entriesEl.className = "empty";
+      entriesEl.textContent = "Sin transcripciones";
+      setError("");
+      setStatus("listo");
+      finalTextEl.textContent = "";
+      updateControls();
+    });
+
+    updateControls();
+  </script>
+</body>
+</html>

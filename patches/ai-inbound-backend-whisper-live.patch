@@ -1,0 +1,745 @@
+diff --git a/inbound_ai/audio_stt.py b/inbound_ai/audio_stt.py
+index 4daf08f..4783c97 100644
+--- a/inbound_ai/audio_stt.py
++++ b/inbound_ai/audio_stt.py
+@@ -6,11 +6,12 @@ import base64
+ import json
+ import re
+ import uuid
++import wave
+ from dataclasses import dataclass
+ from pathlib import Path
+ from typing import Dict
+ from urllib.error import HTTPError, URLError
+-from urllib.parse import urljoin
++from urllib.parse import urljoin, urlparse
+ from urllib.request import Request, urlopen
+ 
+ from .asterisk_agi import clean_transcript, render_command, run_command, safe_basename
+@@ -104,6 +105,7 @@ def transcribe_with_server(
+     stt_server_url: str,
+     language: str = "es",
+     prompt: str = "",
++    audio_ctx: int = 0,
+ ) -> TranscriptionResult:
+     if not stt_server_url.strip():
+         return TranscriptionResult(
+@@ -114,16 +116,35 @@ def transcribe_with_server(
+         )
+ 
+     boundary = "----ai-inbound-" + uuid.uuid4().hex
+-    body = _multipart_body(
+-        boundary,
+-        fields={
++    whisper_cpp_server = _is_whisper_cpp_inference_url(stt_server_url)
++    fields = (
++        {
++            "language": language,
++            "temperature": "0",
++            "temperature_inc": "0",
++            "response_format": "json",
++            "no_timestamps": "true",
++            "beam_size": "1",
++            "best_of": "1",
++            "max_context": "0",
++            "max_len": "40",
++            "prompt": prompt[-300:],
++        }
++        if whisper_cpp_server
++        else {
+             "model": "local",
+             "language": language,
+             "temperature": "0",
+             "response_format": "json",
+             "stream": "false",
+             "prompt": prompt[-300:],
+-        },
++        }
++    )
++    if whisper_cpp_server and audio_ctx > 0:
++        fields["audio_ctx"] = str(audio_ctx)
++    body = _multipart_body(
++        boundary,
++        fields=fields,
+         file_field="file",
+         file_path=audio_file,
+     )
+@@ -166,12 +187,82 @@ def transcribe_audio(
+     prompt: str = "",
+ ) -> TranscriptionResult:
+     if stt_server_url.strip():
+-        return transcribe_with_server(audio_file, stt_server_url, language, prompt)
++        audio_ctx = whisper_cpp_audio_ctx_for_file(audio_file, stt_server_url)
++        duration_seconds = wav_duration_seconds(audio_file) if audio_ctx > 0 else 0.0
++        result = transcribe_with_server(
++            audio_file,
++            stt_server_url,
++            language,
++            prompt,
++            audio_ctx=audio_ctx,
++        )
++        if audio_ctx > 0 and _should_retry_full_context(
++            result.transcript,
++            duration_seconds,
++        ):
++            result = transcribe_with_server(audio_file, stt_server_url, language, prompt)
++        if not result.error or not stt_command.strip():
++            return result
+     return transcribe_with_command(audio_file, stt_command)
+ 
+ 
++def whisper_cpp_audio_ctx_for_file(audio_file: str, stt_server_url: str) -> int:
++    if not _is_whisper_cpp_inference_url(stt_server_url):
++        return 0
++    duration = wav_duration_seconds(audio_file)
++    if duration < 1.0:
++        return 0
++    if duration <= 4.0:
++        return 256
++    if duration <= 8.0:
++        return 1024
++    return 0
++
++
++def wav_duration_seconds(audio_file: str) -> float:
++    try:
++        with wave.open(audio_file, "rb") as wav:
++            return wav.getnframes() / float(wav.getframerate())
++    except (OSError, EOFError, wave.Error, ZeroDivisionError):
++        return 0.0
++
++
++def _looks_degenerate_transcript(text: str) -> bool:
++    if re.search(r"(\w{3,})\1{3,}", text.lower()):
++        return True
++    words = re.findall(r"[\wáéíóúüñ]+", text.lower())
++    if len(words) < 8:
++        return False
++    repeated = 1
++    for index in range(1, len(words)):
++        if words[index] == words[index - 1]:
++            repeated += 1
++            if repeated >= 4:
++                return True
++        else:
++            repeated = 1
++    joined = " ".join(words)
++    for size in range(3, 12):
++        for start in range(0, max(0, len(words) - size * 3 + 1)):
++            phrase = " ".join(words[start : start + size])
++            if phrase and joined.count(phrase) >= 4:
++                return True
++    return False
++
++
++def _should_retry_full_context(text: str, duration_seconds: float) -> bool:
++    words = re.findall(r"[\wáéíóúüñ]+", text.lower())
++    if duration_seconds >= 2.0 and len(words) <= 1:
++        return True
++    if duration_seconds >= 3.0 and len(words) <= 2:
++        return True
++    return _looks_degenerate_transcript(text)
++
++
+ def _transcription_url(stt_server_url: str) -> str:
+     trimmed = stt_server_url.rstrip("/")
++    if _is_whisper_cpp_inference_url(trimmed):
++        return trimmed
+     if trimmed.endswith("/v1/audio/transcriptions"):
+         return trimmed
+     if trimmed.endswith("/v1"):
+@@ -179,6 +270,11 @@ def _transcription_url(stt_server_url: str) -> str:
+     return urljoin(trimmed + "/", "v1/audio/transcriptions")
+ 
+ 
++def _is_whisper_cpp_inference_url(stt_server_url: str) -> bool:
++    path = urlparse(stt_server_url.strip()).path.rstrip("/")
++    return path.endswith("/inference")
++
++
+ def _multipart_body(
+     boundary: str,
+     fields: Dict[str, str],
+diff --git a/inbound_ai/live_stt.py b/inbound_ai/live_stt.py
+index eab01ee..a208021 100644
+--- a/inbound_ai/live_stt.py
++++ b/inbound_ai/live_stt.py
+@@ -8,10 +8,11 @@ import re
+ import tempfile
+ import threading
+ import time
++import unicodedata
+ import wave
+ from dataclasses import dataclass
+ from pathlib import Path
+-from typing import Any, List
++from typing import Any, List, Optional
+ 
+ from .audio_stt import transcribe_audio
+ from .config import Settings
+@@ -19,12 +20,20 @@ from .config import Settings
+ 
+ SAMPLE_RATE = 16_000
+ BYTES_PER_SAMPLE = 2
+-STEP_SECONDS = 0.8
+-MIN_WINDOW_SECONDS = 2.5
++STEP_SECONDS = 0.1
++MIN_WINDOW_SECONDS = 1.2
+ SPEECH_RMS_THRESHOLD = 260
+-SILENCE_FINALIZE_SECONDS = 0.9
+-PRE_ROLL_SECONDS = 0.45
++SILENCE_FINALIZE_SECONDS = 0.3
++PRE_ROLL_SECONDS = 0.25
+ MAX_UTTERANCE_SECONDS = 25
++TRIM_FRAME_SECONDS = 0.02
++TRIM_PADDING_SECONDS = 0.16
++TRIM_RMS_THRESHOLD = 120
++SPECULATIVE_ENABLED = False
++SPECULATIVE_INTERVAL_SECONDS = 0.55
++SPECULATIVE_MIN_NEW_AUDIO_SECONDS = 0.35
++SPECULATIVE_REUSE_TOLERANCE_SECONDS = 0.45
++SPECULATIVE_WAIT_SECONDS = 0.28
+ 
+ 
+ class PcmRingBuffer:
+@@ -55,7 +64,8 @@ class PcmRingBuffer:
+                 if not self.in_speech:
+                     self.utterance = bytearray(self.pre_roll)
+                     self.in_speech = True
+-                self.utterance.extend(payload)
++                else:
++                    self.utterance.extend(payload)
+                 if len(self.utterance) > self.utterance_capacity:
+                     del self.utterance[: len(self.utterance) - self.utterance_capacity]
+                 self.last_speech_at = now
+@@ -76,19 +86,52 @@ class PcmRingBuffer:
+                     return b""
+             utterance = bytes(self.utterance)
+             self.utterance = bytearray()
++            self.pre_roll = bytearray()
+             self.in_speech = False
++            self.last_speech_at = 0.0
+             return utterance
+ 
++    def snapshot_utterance(self) -> bytes:
++        with self.lock:
++            if not self.in_speech or not self.utterance:
++                return b""
++            return bytes(self.utterance)
++
+ 
+ @dataclass
+ class TranscriptState:
+     final_text: str = ""
+ 
+     def commit_final(self, final_hypothesis: str) -> str:
++        final_text, _ = self.commit_final_delta(final_hypothesis)
++        return final_text
++
++    def commit_final_delta(self, final_hypothesis: str) -> tuple[str, str]:
+         new_part = remove_confirmed_overlap(final_hypothesis, self.final_text)
++        new_part = remove_duplicate_prefix(self.final_text, new_part)
+         if new_part.strip():
+-            self.final_text = append_without_duplicate_overlap(self.final_text, new_part)
+-        return self.final_text
++            self.final_text = join_words(self.final_text, new_part)
++        return self.final_text, new_part
++
++
++@dataclass
++class SttOutcome:
++    hypothesis: str
++    error: str
++    inference_ms: int
++    duration_ms: int
++    source_bytes: int
++    trimmed_bytes: int
++
++
++@dataclass
++class SpeculativeResult:
++    hypothesis: str
++    inference_ms: int
++    duration_ms: int
++    source_bytes: int
++    trimmed_bytes: int
++    completed_at: float
+ 
+ 
+ class LiveSttBridge:
+@@ -99,6 +142,12 @@ class LiveSttBridge:
+         self.state = TranscriptState()
+         self.closed = threading.Event()
+         self.started_at = time.monotonic()
++        self.speculative_lock = threading.Lock()
++        self.speculative_inflight = False
++        self.latest_speculative: Optional[SpeculativeResult] = None
++        self.last_speculative_source_bytes = 0
++        self.last_speculative_started_at = 0.0
++        self.speculative_generation = 0
+ 
+     def run(self) -> None:
+         worker = threading.Thread(target=self._infer_loop, name="live-stt", daemon=True)
+@@ -139,10 +188,12 @@ class LiveSttBridge:
+             self.closed.set()
+         if event.get("type") == "reset":
+             self.state = TranscriptState()
++            self._clear_speculative_result()
+ 
+     def _infer_loop(self) -> None:
+         while not self.closed.is_set():
+             time.sleep(STEP_SECONDS)
++            self._maybe_start_speculative_transcription()
+             self._maybe_finalize_on_silence()
+ 
+     def _maybe_finalize_on_silence(self) -> None:
+@@ -154,7 +205,168 @@ class LiveSttBridge:
+     def _transcribe_final_utterance(self, pcm: bytes) -> None:
+         if len(pcm) < int(MIN_WINDOW_SECONDS * SAMPLE_RATE * BYTES_PER_SAMPLE):
+             return
+-        audio_file = self._write_temp_wav(pcm, "final-stt-")
++        delivery_started = time.perf_counter()
++        trimmed = trim_pcm_for_stt(pcm)
++        speculative = self._wait_for_matching_speculative_result(
++            len(pcm),
++            len(trimmed),
++        )
++        if speculative:
++            delivery_ms = int((time.perf_counter() - delivery_started) * 1000)
++            self._send_final_transcript(
++                speculative.hypothesis,
++                speculative.inference_ms,
++                speculative.duration_ms,
++                delivery_ms,
++                speculative=True,
++            )
++            self._clear_speculative_result()
++            return
++
++        outcome = self._transcribe_pcm(pcm, "final-stt-")
++        if outcome.error:
++            self.websocket.send_json({"type": "error", "detail": outcome.error})
++            return
++        delivery_ms = int((time.perf_counter() - delivery_started) * 1000)
++        self._send_final_transcript(
++            outcome.hypothesis,
++            outcome.inference_ms,
++            outcome.duration_ms,
++            delivery_ms,
++            speculative=False,
++        )
++        self._clear_speculative_result()
++
++    def _send_final_transcript(
++        self,
++        hypothesis: str,
++        inference_ms: int,
++        duration_ms: int,
++        delivery_ms: int,
++        speculative: bool,
++    ) -> None:
++        hypothesis = hypothesis.strip()
++        if not hypothesis:
++            return
++        final_text, committed_hypothesis = self.state.commit_final_delta(hypothesis)
++        if not committed_hypothesis.strip():
++            return
++        rtf = inference_ms / max(duration_ms, 1)
++        self.websocket.send_json(
++            {
++                "type": "transcript",
++                "final_text": final_text,
++                "hypothesis": committed_hypothesis,
++                "raw_hypothesis": hypothesis,
++                "inference_ms": inference_ms,
++                "delivery_ms": delivery_ms,
++                "window_ms": duration_ms,
++                "rtf": round(rtf, 3),
++                "final": True,
++                "speculative": speculative,
++            }
++        )
++
++    def _maybe_start_speculative_transcription(self) -> None:
++        if not SPECULATIVE_ENABLED:
++            return
++        pcm = self.ring.snapshot_utterance()
++        if len(pcm) < int(MIN_WINDOW_SECONDS * SAMPLE_RATE * BYTES_PER_SAMPLE):
++            return
++
++        now = time.monotonic()
++        min_new_bytes = int(
++            SPECULATIVE_MIN_NEW_AUDIO_SECONDS * SAMPLE_RATE * BYTES_PER_SAMPLE
++        )
++        with self.speculative_lock:
++            if len(pcm) < self.last_speculative_source_bytes:
++                self.latest_speculative = None
++                self.last_speculative_source_bytes = 0
++            if self.speculative_inflight:
++                return
++            if now - self.last_speculative_started_at < SPECULATIVE_INTERVAL_SECONDS:
++                return
++            if (
++                self.latest_speculative
++                and len(pcm) - self.last_speculative_source_bytes < min_new_bytes
++            ):
++                return
++            self.speculative_inflight = True
++            self.last_speculative_started_at = now
++            self.last_speculative_source_bytes = len(pcm)
++            generation = self.speculative_generation
++
++        worker = threading.Thread(
++            target=self._run_speculative_transcription,
++            args=(pcm, generation),
++            name="live-stt-speculative",
++            daemon=True,
++        )
++        worker.start()
++
++    def _run_speculative_transcription(self, pcm: bytes, generation: int) -> None:
++        outcome = self._transcribe_pcm(pcm, "spec-stt-")
++        with self.speculative_lock:
++            self.speculative_inflight = False
++            if generation != self.speculative_generation:
++                return
++            if outcome.error or not outcome.hypothesis.strip():
++                return
++            self.latest_speculative = SpeculativeResult(
++                hypothesis=outcome.hypothesis,
++                inference_ms=outcome.inference_ms,
++                duration_ms=outcome.duration_ms,
++                source_bytes=outcome.source_bytes,
++                trimmed_bytes=outcome.trimmed_bytes,
++                completed_at=time.monotonic(),
++            )
++
++    def _wait_for_matching_speculative_result(
++        self,
++        source_bytes: int,
++        trimmed_bytes: int,
++    ) -> Optional[SpeculativeResult]:
++        if not SPECULATIVE_ENABLED:
++            return None
++        deadline = time.monotonic() + SPECULATIVE_WAIT_SECONDS
++        while True:
++            result = self._matching_speculative_result(source_bytes, trimmed_bytes)
++            if result:
++                return result
++            with self.speculative_lock:
++                inflight = self.speculative_inflight
++            if not inflight or time.monotonic() >= deadline:
++                return None
++            time.sleep(0.01)
++
++    def _matching_speculative_result(
++        self,
++        source_bytes: int,
++        trimmed_bytes: int,
++    ) -> Optional[SpeculativeResult]:
++        tolerance = int(
++            SPECULATIVE_REUSE_TOLERANCE_SECONDS * SAMPLE_RATE * BYTES_PER_SAMPLE
++        )
++        with self.speculative_lock:
++            result = self.latest_speculative
++            if not result:
++                return None
++            if source_bytes - result.source_bytes > tolerance:
++                return None
++            if trimmed_bytes - result.trimmed_bytes > tolerance:
++                return None
++            return result
++
++    def _clear_speculative_result(self) -> None:
++        with self.speculative_lock:
++            self.speculative_generation += 1
++            self.latest_speculative = None
++            self.last_speculative_source_bytes = 0
++
++    def _transcribe_pcm(self, pcm: bytes, prefix: str) -> SttOutcome:
++        source_bytes = len(pcm)
++        trimmed = trim_pcm_for_stt(pcm)
++        audio_file = self._write_temp_wav(trimmed, prefix)
+         try:
+             started = time.perf_counter()
+             result = transcribe_audio(
+@@ -171,25 +383,14 @@ class LiveSttBridge:
+             except OSError:
+                 pass
+ 
+-        if result.error:
+-            self.websocket.send_json({"type": "error", "detail": result.error})
+-            return
+-        hypothesis = result.transcript.strip()
+-        if not hypothesis:
+-            return
+-        final_text = self.state.commit_final(hypothesis)
+-        duration_ms = int(len(pcm) / (SAMPLE_RATE * BYTES_PER_SAMPLE) * 1000)
+-        rtf = inference_ms / max(duration_ms, 1)
+-        self.websocket.send_json(
+-            {
+-                "type": "transcript",
+-                "final_text": final_text,
+-                "hypothesis": hypothesis,
+-                "inference_ms": inference_ms,
+-                "window_ms": duration_ms,
+-                "rtf": round(rtf, 3),
+-                "final": True,
+-            }
++        duration_ms = int(len(trimmed) / (SAMPLE_RATE * BYTES_PER_SAMPLE) * 1000)
++        return SttOutcome(
++            hypothesis=result.transcript.strip(),
++            error=result.error,
++            inference_ms=inference_ms,
++            duration_ms=duration_ms,
++            source_bytes=source_bytes,
++            trimmed_bytes=len(trimmed),
+         )
+ 
+     def _write_temp_wav(self, pcm: bytes, prefix: str) -> str:
+@@ -225,12 +426,49 @@ def pcm_rms(payload: bytes) -> float:
+     return math.sqrt(total / max(1, count))
+ 
+ 
++def trim_pcm_for_stt(
++    pcm: bytes,
++    sample_rate: int = SAMPLE_RATE,
++    threshold: int = TRIM_RMS_THRESHOLD,
++) -> bytes:
++    if len(pcm) < BYTES_PER_SAMPLE:
++        return pcm
++    if len(pcm) % BYTES_PER_SAMPLE:
++        pcm = pcm[:-1]
++    frame_bytes = max(
++        BYTES_PER_SAMPLE,
++        int(sample_rate * BYTES_PER_SAMPLE * TRIM_FRAME_SECONDS),
++    )
++    frame_bytes -= frame_bytes % BYTES_PER_SAMPLE
++    speech_frames: List[tuple[int, int]] = []
++    for start in range(0, len(pcm), frame_bytes):
++        end = min(len(pcm), start + frame_bytes)
++        if pcm_rms(pcm[start:end]) >= threshold:
++            speech_frames.append((start, end))
++    if not speech_frames:
++        return pcm
++    padding_bytes = int(sample_rate * BYTES_PER_SAMPLE * TRIM_PADDING_SECONDS)
++    padding_bytes -= padding_bytes % BYTES_PER_SAMPLE
++    start = max(0, speech_frames[0][0] - padding_bytes)
++    end = min(len(pcm), speech_frames[-1][1] + padding_bytes)
++    return pcm[start:end]
++
++
+ def word_list(text: str) -> List[str]:
+     return re.findall(r"\S+", re.sub(r"\s+", " ", text).strip())
+ 
+ 
+ def normalized_words(text: str) -> List[str]:
+-    return [re.sub(r"[^\wáéíóúüñ]+", "", word.lower()) for word in word_list(text)]
++    return [normalize_word(word) for word in word_list(text)]
++
++
++def normalize_word(word: str) -> str:
++    without_marks = "".join(
++        char
++        for char in unicodedata.normalize("NFKD", word.lower())
++        if not unicodedata.combining(char)
++    )
++    return re.sub(r"[^\w]+", "", without_marks)
+ 
+ 
+ def remove_confirmed_overlap(hypothesis: str, final_text: str) -> str:
+@@ -248,9 +486,13 @@ def remove_confirmed_overlap(hypothesis: str, final_text: str) -> str:
+ 
+ 
+ def append_without_duplicate_overlap(existing: str, addition: str) -> str:
++    return join_words(existing, remove_duplicate_prefix(existing, addition))
++
++
++def remove_duplicate_prefix(existing: str, addition: str) -> str:
+     addition = addition.strip()
+     if not addition:
+-        return existing.strip()
++        return ""
+     if not existing.strip():
+         return addition
+     existing_words = word_list(existing)
+@@ -260,5 +502,13 @@ def append_without_duplicate_overlap(existing: str, addition: str) -> str:
+     max_overlap = min(len(existing_norm), len(addition_norm), 30)
+     for size in range(max_overlap, 0, -1):
+         if existing_norm[-size:] == addition_norm[:size]:
+-            return " ".join(existing_words + addition_words[size:])
+-    return " ".join(existing_words + addition_words)
++            return " ".join(addition_words[size:])
++    return " ".join(addition_words)
++
++
++def join_words(existing: str, addition: str) -> str:
++    existing = existing.strip()
++    addition = addition.strip()
++    if existing and addition:
++        return f"{existing} {addition}"
++    return existing or addition
+diff --git a/static/transcribe-test.html b/static/transcribe-test.html
+index 20e490c..3ca8d5e 100644
+--- a/static/transcribe-test.html
++++ b/static/transcribe-test.html
+@@ -377,7 +377,9 @@
+       const meta = document.createElement("div");
+       meta.className = "meta";
+       if (data.final) meta.append(metaPill("final"));
++      if (data.speculative) meta.append(metaPill("precalculated"));
+       meta.append(metaPill(`audio ${Math.round(durationMs / 100) / 10}s`));
++      if (Number.isFinite(data.delivery_ms)) meta.append(metaPill(`delivery ${data.delivery_ms}ms`));
+       meta.append(metaPill(`stt ${data.inference_ms || data.stt_ms || 0}ms`));
+       if (data.rtf) meta.append(metaPill(`rtf ${data.rtf}`));
+       entry.append(transcript, meta);
+diff --git a/tests/test_audio_stt.py b/tests/test_audio_stt.py
+index c070022..f5f9bb5 100644
+--- a/tests/test_audio_stt.py
++++ b/tests/test_audio_stt.py
+@@ -1,13 +1,16 @@
+ import base64
+ import tempfile
+ import unittest
++import wave
+ 
+ from inbound_ai.audio_stt import (
++    _looks_degenerate_transcript,
+     extension_for_mime,
+     save_audio_upload,
+     transcribe_with_command,
++    whisper_cpp_audio_ctx_for_file,
+ )
+-from inbound_ai.live_stt import TranscriptState
++from inbound_ai.live_stt import PcmRingBuffer, SAMPLE_RATE, TranscriptState, trim_pcm_for_stt
+ 
+ 
+ class AudioSttTests(unittest.TestCase):
+@@ -26,11 +29,127 @@ class AudioSttTests(unittest.TestCase):
+         self.assertFalse(result.configured)
+         self.assertEqual(result.transcript, "")
+ 
++    def test_whisper_cpp_audio_ctx_for_short_precise_windows(self):
++        with tempfile.NamedTemporaryFile(suffix=".wav") as tmp:
++            with wave.open(tmp.name, "wb") as wav:
++                wav.setnchannels(1)
++                wav.setsampwidth(2)
++                wav.setframerate(16000)
++                wav.writeframes(b"\0\0" * int(16000 * 2.8))
++
++            audio_ctx = whisper_cpp_audio_ctx_for_file(
++                tmp.name,
++                "http://127.0.0.1:50061/inference",
++            )
++
++        self.assertEqual(audio_ctx, 256)
++
++    def test_whisper_cpp_audio_ctx_uses_short_context_for_live_windows(self):
++        with tempfile.NamedTemporaryFile(suffix=".wav") as tmp:
++            with wave.open(tmp.name, "wb") as wav:
++                wav.setnchannels(1)
++                wav.setsampwidth(2)
++                wav.setframerate(16000)
++                wav.writeframes(b"\0\0" * int(16000 * 1.5))
++
++            audio_ctx = whisper_cpp_audio_ctx_for_file(
++                tmp.name,
++                "http://127.0.0.1:50061/inference",
++            )
++
++        self.assertEqual(audio_ctx, 256)
++
++    def test_whisper_cpp_audio_ctx_skips_subsecond_audio(self):
++        with tempfile.NamedTemporaryFile(suffix=".wav") as tmp:
++            with wave.open(tmp.name, "wb") as wav:
++                wav.setnchannels(1)
++                wav.setsampwidth(2)
++                wav.setframerate(16000)
++                wav.writeframes(b"\0\0" * int(16000 * 0.8))
++
++            audio_ctx = whisper_cpp_audio_ctx_for_file(
++                tmp.name,
++                "http://127.0.0.1:50061/inference",
++            )
++
++        self.assertEqual(audio_ctx, 0)
++
++    def test_degenerate_transcript_detection(self):
++        self.assertTrue(
++            _looks_degenerate_transcript(
++                "me llamo Alan y necesito repar reparararararararararara "
++                "reparararararararararara"
++            )
++        )
++        self.assertFalse(
++            _looks_degenerate_transcript(
++                "Me llamo Alan y necesito reparar una fuga hoy."
++            )
++        )
++
+     def test_live_state_commits_only_final_text(self):
+         state = TranscriptState()
+         final_text = state.commit_final("me llamo Alan")
+         self.assertEqual(final_text, "me llamo Alan")
+ 
++    def test_live_ring_does_not_duplicate_first_speech_chunk(self):
++        ring = PcmRingBuffer(SAMPLE_RATE)
++        silence = b"\0\0" * 800
++        speech = (1000).to_bytes(2, "little", signed=True) * 800
++
++        ring.append(silence)
++        ring.append(speech)
++        utterance = ring.snapshot_utterance()
++
++        self.assertEqual(utterance, silence + speech)
++
++    def test_live_ring_clears_pre_roll_after_final_utterance(self):
++        ring = PcmRingBuffer(SAMPLE_RATE)
++        silence = b"\0\0" * 800
++        first_speech = (1000).to_bytes(2, "little", signed=True) * 800
++        next_speech = (1200).to_bytes(2, "little", signed=True) * 800
++
++        ring.append(silence)
++        ring.append(first_speech)
++        utterance = ring.extract_utterance_if_ready(0, force=True)
++        ring.append(next_speech)
++
++        self.assertEqual(utterance, silence + first_speech)
++        self.assertEqual(ring.snapshot_utterance(), next_speech)
++
++    def test_live_state_dedupes_accented_overlap(self):
++        state = TranscriptState()
++        state.commit_final("Me llamo Alan")
++
++        final_text = state.commit_final("Me llamo Alán y necesito reparar")
++
++        self.assertEqual(final_text, "Me llamo Alan y necesito reparar")
++
++    def test_live_state_returns_empty_delta_for_duplicate(self):
++        state = TranscriptState("Me llamo Alan")
++
++        final_text, delta = state.commit_final_delta("Me llamo Alán")
++
++        self.assertEqual(final_text, "Me llamo Alan")
++        self.assertEqual(delta, "")
++
++    def test_trim_pcm_for_stt_removes_outer_silence(self):
++        silence_before = b"\0\0" * int(SAMPLE_RATE * 0.5)
++        speech = (1000).to_bytes(2, "little", signed=True) * int(SAMPLE_RATE * 0.4)
++        silence_after = b"\0\0" * int(SAMPLE_RATE * 0.6)
++        pcm = silence_before + speech + silence_after
++
++        trimmed = trim_pcm_for_stt(pcm)
++
++        self.assertLess(len(trimmed), len(pcm))
++        self.assertGreater(len(trimmed), len(speech))
++        self.assertLess(len(trimmed), len(speech) + len(silence_before))
++
++    def test_trim_pcm_for_stt_keeps_all_silence(self):
++        pcm = b"\0\0" * int(SAMPLE_RATE * 0.5)
++
++        self.assertEqual(trim_pcm_for_stt(pcm), pcm)
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

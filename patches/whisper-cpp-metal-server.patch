@@ -1,0 +1,430 @@
+diff --git a/examples/server/server.cpp b/examples/server/server.cpp
+index 08c0988d..f845aa7a 100644
+--- a/examples/server/server.cpp
++++ b/examples/server/server.cpp
+@@ -78,6 +78,7 @@ struct whisper_params {
+     int32_t progress_step = 5;
+     int32_t max_context   = -1;
+     int32_t max_len       = 0;
++    int32_t max_tokens    = 0;
+     int32_t best_of       = 2;
+     int32_t beam_size     = -1;
+     int32_t audio_ctx     = 0;
+@@ -147,6 +148,7 @@ void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & para
+     fprintf(stderr, "  -d  N,     --duration N        [%-7d] duration of audio to process in milliseconds\n",   params.duration_ms);
+     fprintf(stderr, "  -mc N,     --max-context N     [%-7d] maximum number of text context tokens to store\n", params.max_context);
+     fprintf(stderr, "  -ml N,     --max-len N         [%-7d] maximum segment length in characters\n",           params.max_len);
++    fprintf(stderr, "  -mt N,     --max-tokens N      [%-7d] maximum tokens per segment\n",                     params.max_tokens);
+     fprintf(stderr, "  -sow,      --split-on-word     [%-7s] split on word rather than on token\n",             params.split_on_word ? "true" : "false");
+     fprintf(stderr, "  -bo N,     --best-of N         [%-7d] number of best candidates to keep\n",              params.best_of);
+     fprintf(stderr, "  -bs N,     --beam-size N       [%-7d] beam size for beam search\n",                      params.beam_size);
+@@ -219,6 +221,7 @@ bool whisper_params_parse(int argc, char ** argv, whisper_params & params, serve
+         else if (arg == "-d"    || arg == "--duration")        { params.duration_ms     = std::stoi(argv[++i]); }
+         else if (arg == "-mc"   || arg == "--max-context")     { params.max_context     = std::stoi(argv[++i]); }
+         else if (arg == "-ml"   || arg == "--max-len")         { params.max_len         = std::stoi(argv[++i]); }
++        else if (arg == "-mt"   || arg == "--max-tokens")      { params.max_tokens      = std::stoi(argv[++i]); }
+         else if (arg == "-bo"   || arg == "--best-of")         { params.best_of         = std::stoi(argv[++i]); }
+         else if (arg == "-bs"   || arg == "--beam-size")       { params.beam_size       = std::stoi(argv[++i]); }
+         else if (arg == "-ac"   || arg == "--audio-ctx")       { params.audio_ctx       = std::stoi(argv[++i]); }
+@@ -503,6 +506,10 @@ void get_req_parameters(const Request & req, whisper_params & params)
+     {
+         params.max_len = std::stoi(req.get_file_value("max_len").content);
+     }
++    if (req.has_file("max_tokens"))
++    {
++        params.max_tokens = std::stoi(req.get_file_value("max_tokens").content);
++    }
+     if (req.has_file("best_of"))
+     {
+         params.best_of = std::stoi(req.get_file_value("best_of").content);
+@@ -927,6 +934,7 @@ int main(int argc, char ** argv) {
+ 
+             wparams.thold_pt         = params.word_thold;
+             wparams.max_len          = params.max_len == 0 ? 60 : params.max_len;
++            wparams.max_tokens       = params.max_tokens;
+             wparams.split_on_word    = params.split_on_word;
+             wparams.audio_ctx        = params.audio_ctx;
+ 
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
+index d211bf79..ae008c2c 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
+@@ -1626,9 +1626,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_norm(ggml_metal_
+     switch (op->op) {
+         case GGML_OP_NORM:
+             switch (n_fuse) {
+-                case 1: snprintf(base, 256, "kernel_norm_f32%s", suffix);         break;
+-                case 2: snprintf(base, 256, "kernel_norm_mul_f32%s", suffix);     break;
+-                case 3: snprintf(base, 256, "kernel_norm_mul_add_f32%s", suffix); break;
++                case 1: snprintf(base, 256, op->ne[0] == 1280 ? "kernel_norm_f32_4_whisper_1280"         : "kernel_norm_f32%s", suffix);         break;
++                case 2: snprintf(base, 256, op->ne[0] == 1280 ? "kernel_norm_mul_f32_4_whisper_1280"     : "kernel_norm_mul_f32%s", suffix);     break;
++                case 3: snprintf(base, 256, op->ne[0] == 1280 ? "kernel_norm_mul_add_f32_4_whisper_1280" : "kernel_norm_mul_add_f32%s", suffix); break;
+                 default: GGML_ABORT("fatal error");
+             } break;
+         case GGML_OP_RMS_NORM:
+diff --git a/ggml/src/ggml-metal/ggml-metal.metal b/ggml/src/ggml-metal/ggml-metal.metal
+index c372eaed..1637e3b9 100644
+--- a/ggml/src/ggml-metal/ggml-metal.metal
++++ b/ggml/src/ggml-metal/ggml-metal.metal
+@@ -2983,6 +2983,100 @@ template [[host_name("kernel_norm_f32_4")]]         kernel kernel_norm_fuse_t ke
+ template [[host_name("kernel_norm_mul_f32_4")]]     kernel kernel_norm_fuse_t kernel_norm_fuse_impl<float4, 2>;
+ template [[host_name("kernel_norm_mul_add_f32_4")]] kernel kernel_norm_fuse_t kernel_norm_fuse_impl<float4, 3>;
+ 
++// Whisper large-v3-turbo decoder layer norm route. The body intentionally
++// matches ggml's validated vectorized norm kernel while giving the 1280-wide
++// decoder path a distinct Metal entrypoint for targeted profiling/tuning.
++template <typename T, short F>
++kernel void kernel_norm_fuse_whisper_1280_impl(
++        constant ggml_metal_kargs_norm & args,
++        device const char * src0,
++        device const char * src1_0,
++        device const char * src1_1,
++        device       char * dst,
++        threadgroup float * shmem_f32 [[threadgroup(0)]],
++        uint3   tgpig[[threadgroup_position_in_grid]],
++        ushort3 tpitg[[thread_position_in_threadgroup]],
++        ushort  sgitg[[simdgroup_index_in_threadgroup]],
++        ushort  tiisg[[thread_index_in_simdgroup]],
++        ushort3   ntg[[threads_per_threadgroup]]) {
++    if (sgitg == 0) {
++        shmem_f32[tiisg] = 0.0f;
++    }
++
++    const int i01 = tgpig.x;
++    const int i02 = tgpig.y;
++    const int i03 = tgpig.z;
++
++    device const T * x = (device const T *) (src0 + i03*args.nbf3[0] + i02*args.nbf2[0] + i01*args.nbf1[0]);
++
++    device const T * f0 = (device const T *) (src1_0 + (i03%args.nef3[1])*args.nbf3[1] + (i02%args.nef2[1])*args.nbf2[1] + (i01%args.nef1[1])*args.nbf1[1]);
++    device const T * f1 = (device const T *) (src1_1 + (i03%args.nef3[2])*args.nbf3[2] + (i02%args.nef2[2])*args.nbf2[2] + (i01%args.nef1[2])*args.nbf1[2]);
++
++    T sumft(0.0f);
++
++    float sumf = 0.0f;
++
++    for (int i00 = tpitg.x; i00 < args.ne00_t; i00 += ntg.x) {
++        sumft += x[i00];
++    }
++    sumf = dot(sumft, T(1.0f));
++    sumf = simd_sum(sumf);
++
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++    if (tiisg == 0) {
++        shmem_f32[sgitg] = sumf;
++    }
++
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++    sumf = shmem_f32[tiisg];
++    sumf = simd_sum(sumf);
++
++    const float mean = sumf/args.ne00;
++
++    device T * y = (device T *) (dst + i03*args.nb3 + i02*args.nb2 + i01*args.nb1);
++
++    sumf = 0.0f;
++    for (int i00 = tpitg.x; i00 < args.ne00_t; i00 += ntg.x) {
++        y[i00] = x[i00] - mean;
++        sumf += dot(y[i00], y[i00]);
++    }
++    sumf = simd_sum(sumf);
++
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++    if (tiisg == 0) {
++        shmem_f32[sgitg] = sumf;
++    }
++
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++    sumf = shmem_f32[tiisg];
++    sumf = simd_sum(sumf);
++
++    const float variance = sumf/args.ne00;
++
++    const float scale = 1.0f/sqrt(variance + args.eps);
++    for (int i00 = tpitg.x; i00 < args.ne00_t; i00 += ntg.x) {
++        if (F == 1) {
++            y[i00] = (y[i00]*scale);
++        }
++        if (F == 2) {
++            y[i00] = (y[i00]*scale)*f0[i00];
++        }
++        if (F == 3) {
++            y[i00] = (y[i00]*scale)*f0[i00] + f1[i00];
++        }
++    }
++}
++
++typedef decltype(kernel_norm_fuse_whisper_1280_impl<float4, 1>) kernel_norm_fuse_whisper_1280_t;
++
++template [[host_name("kernel_norm_f32_4_whisper_1280")]]         kernel kernel_norm_fuse_whisper_1280_t kernel_norm_fuse_whisper_1280_impl<float4, 1>;
++template [[host_name("kernel_norm_mul_f32_4_whisper_1280")]]     kernel kernel_norm_fuse_whisper_1280_t kernel_norm_fuse_whisper_1280_impl<float4, 2>;
++template [[host_name("kernel_norm_mul_add_f32_4_whisper_1280")]] kernel kernel_norm_fuse_whisper_1280_t kernel_norm_fuse_whisper_1280_impl<float4, 3>;
++
+ // F == 1 : rms_norm (no fuse)
+ // F == 2 : rms_norm + mul
+ // F == 3 : rms_norm + mul + add
+diff --git a/src/coreml/whisper-encoder.mm b/src/coreml/whisper-encoder.mm
+index 81a5a6aa..718c0a9a 100644
+--- a/src/coreml/whisper-encoder.mm
++++ b/src/coreml/whisper-encoder.mm
+@@ -3,20 +3,47 @@
+ #endif
+ 
+ #import "whisper-encoder.h"
+-#import "whisper-encoder-impl.h"
+ 
+ #import <CoreML/CoreML.h>
+ 
++#include <string.h>
+ #include <stdlib.h>
++#include <algorithm>
++#include <vector>
+ 
+ #if __cplusplus
+ extern "C" {
+ #endif
+ 
+ struct whisper_coreml_context {
+-    const void * data;
++    MLModel  * model;
++    NSString * input_name;
++    NSString * output_name;
+ };
+ 
++static uint16_t whisper_f32_to_f16_bits(float value) {
++    __fp16 half = (__fp16) value;
++    uint16_t bits;
++    memcpy(&bits, &half, sizeof(bits));
++    return bits;
++}
++
++static float whisper_f16_bits_to_f32(uint16_t bits) {
++    __fp16 half;
++    memcpy(&half, &bits, sizeof(half));
++    return (float) half;
++}
++
++static NSString * whisper_coreml_pick_feature_name(NSDictionary<NSString *, MLFeatureDescription *> * features, NSArray<NSString *> * candidates) {
++    for (NSString * candidate in candidates) {
++        if ([features objectForKey:candidate] != nil) {
++            return candidate;
++        }
++    }
++
++    return features.allKeys.firstObject;
++}
++
+ struct whisper_coreml_context * whisper_coreml_init(const char * path_model) {
+     NSString * path_model_str = [[NSString alloc] initWithUTF8String:path_model];
+ 
+@@ -28,21 +55,38 @@
+     //config.computeUnits = MLComputeUnitsCPUAndNeuralEngine;
+     config.computeUnits = MLComputeUnitsAll;
+ 
+-    const void * data = CFBridgingRetain([[whisper_encoder_impl alloc] initWithContentsOfURL:url_model configuration:config error:nil]);
++    NSError * error = nil;
++    MLModel * model = [MLModel modelWithContentsOfURL:url_model configuration:config error:&error];
+ 
+-    if (data == NULL) {
++    if (model == nil) {
++        NSLog(@"whisper.cpp CoreML: failed to load model at %@: %@", path_model_str, error);
+         return NULL;
+     }
+ 
+     whisper_coreml_context * ctx = new whisper_coreml_context;
+ 
+-    ctx->data = data;
++    ctx->model = model;
++    ctx->input_name = whisper_coreml_pick_feature_name(
++        model.modelDescription.inputDescriptionsByName,
++        @[@"melspectrogram_features", @"logmel_data"]
++    );
++    ctx->output_name = whisper_coreml_pick_feature_name(
++        model.modelDescription.outputDescriptionsByName,
++        @[@"encoder_output_embeds", @"output"]
++    );
++
++    if (ctx->input_name == nil || ctx->output_name == nil) {
++        NSLog(@"whisper.cpp CoreML: model is missing usable input/output features");
++        delete ctx;
++        return NULL;
++    }
++
++    NSLog(@"whisper.cpp CoreML: input=%@ output=%@", ctx->input_name, ctx->output_name);
+ 
+     return ctx;
+ }
+ 
+ void whisper_coreml_free(struct whisper_coreml_context * ctx) {
+-    CFRelease(ctx->data);
+     delete ctx;
+ }
+ 
+@@ -52,19 +96,151 @@ void whisper_coreml_encode(
+                              int64_t   n_mel,
+                                float * mel,
+                                float * out) {
+-    MLMultiArray * inMultiArray = [
+-        [MLMultiArray alloc] initWithDataPointer: mel
+-                                           shape: @[@1, @(n_mel), @(n_ctx)]
+-                                        dataType: MLMultiArrayDataTypeFloat32
+-                                         strides: @[@(n_ctx*n_mel), @(n_ctx), @1]
+-                                     deallocator: nil
+-                                           error: nil
+-    ];
+-
+     @autoreleasepool {
+-        whisper_encoder_implOutput * outCoreML = [(__bridge id) ctx->data predictionFromLogmel_data:inMultiArray error:nil];
+-
+-        memcpy(out, outCoreML.output.dataPointer, outCoreML.output.count * sizeof(float));
++        MLFeatureDescription * input_desc = [ctx->model.modelDescription.inputDescriptionsByName objectForKey:ctx->input_name];
++        MLMultiArrayDataType input_type = input_desc.multiArrayConstraint.dataType;
++        NSArray<NSNumber *> * input_shape = input_desc.multiArrayConstraint.shape;
++        const bool input_rank4 = input_shape.count == 4;
++
++        std::vector<uint16_t> mel_f16;
++        std::vector<float> mel_f32_padded;
++        MLMultiArray * inMultiArray = nil;
++        NSError * error = nil;
++        const int64_t model_n_mel = input_shape.count > 1 ? input_shape[1].longLongValue : n_mel;
++        const int64_t model_n_ctx = input_rank4 ? input_shape[3].longLongValue : input_shape[2].longLongValue;
++        const int64_t input_n_mel = model_n_mel > 0 ? model_n_mel : n_mel;
++        const int64_t input_n_ctx = model_n_ctx > 0 ? model_n_ctx : n_ctx;
++        NSArray<NSNumber *> * mel_shape = input_rank4 ? @[@1, @(input_n_mel), @1, @(input_n_ctx)] : @[@1, @(input_n_mel), @(input_n_ctx)];
++        NSArray<NSNumber *> * mel_strides = input_rank4 ? @[@(input_n_ctx*input_n_mel), @(input_n_ctx), @(input_n_ctx), @1] : @[@(input_n_ctx*input_n_mel), @(input_n_ctx), @1];
++
++        if (input_type == MLMultiArrayDataTypeFloat16) {
++            mel_f16.resize(input_n_ctx*input_n_mel);
++            for (int64_t im = 0; im < n_mel && im < input_n_mel; ++im) {
++                for (int64_t ic = 0; ic < n_ctx && ic < input_n_ctx; ++ic) {
++                    mel_f16[im*input_n_ctx + ic] = whisper_f32_to_f16_bits(mel[im*n_ctx + ic]);
++                }
++            }
++
++            inMultiArray = [
++                [MLMultiArray alloc] initWithDataPointer: mel_f16.data()
++                                                   shape: mel_shape
++                                                dataType: MLMultiArrayDataTypeFloat16
++                                                 strides: mel_strides
++                                             deallocator: nil
++                                                   error: &error
++            ];
++        } else {
++            if (input_n_ctx != n_ctx || input_n_mel != n_mel) {
++                mel_f32_padded.resize(input_n_ctx*input_n_mel);
++                for (int64_t im = 0; im < n_mel && im < input_n_mel; ++im) {
++                    memcpy(mel_f32_padded.data() + im*input_n_ctx, mel + im*n_ctx, sizeof(float)*std::min(n_ctx, input_n_ctx));
++                }
++                inMultiArray = [
++                    [MLMultiArray alloc] initWithDataPointer: mel_f32_padded.data()
++                                                       shape: mel_shape
++                                                    dataType: MLMultiArrayDataTypeFloat32
++                                                     strides: mel_strides
++                                                 deallocator: nil
++                                                       error: &error
++                ];
++            } else {
++                inMultiArray = [
++                    [MLMultiArray alloc] initWithDataPointer: mel
++                                                       shape: mel_shape
++                                                    dataType: MLMultiArrayDataTypeFloat32
++                                                     strides: mel_strides
++                                                 deallocator: nil
++                                                       error: &error
++                ];
++            }
++        }
++
++        if (inMultiArray == nil) {
++            NSLog(@"whisper.cpp CoreML: failed to create input multiarray: %@", error);
++            return;
++        }
++
++        MLDictionaryFeatureProvider * inProvider = [[MLDictionaryFeatureProvider alloc]
++            initWithDictionary:@{ ctx->input_name: inMultiArray }
++                         error:&error
++        ];
++
++        if (inProvider == nil) {
++            NSLog(@"whisper.cpp CoreML: failed to create input provider: %@", error);
++            return;
++        }
++
++        id<MLFeatureProvider> outProvider = [ctx->model predictionFromFeatures:inProvider error:&error];
++
++        if (outProvider == nil) {
++            NSLog(@"whisper.cpp CoreML: prediction failed: %@", error);
++            return;
++        }
++
++        MLFeatureValue * outValue = [outProvider featureValueForName:ctx->output_name];
++        MLMultiArray * outMultiArray = outValue.multiArrayValue;
++
++        if (outMultiArray == nil) {
++            NSLog(@"whisper.cpp CoreML: missing output multiarray %@", ctx->output_name);
++            return;
++        }
++
++        NSArray<NSNumber *> * shape = outMultiArray.shape;
++        NSArray<NSNumber *> * strides = outMultiArray.strides;
++        const int rank = (int) shape.count;
++        const int64_t requested_out_ctx = n_ctx/2;
++        const int64_t model_out_ctx = input_n_ctx/2;
++        int64_t n_state = outMultiArray.count / model_out_ctx;
++        int64_t n_out_ctx = model_out_ctx;
++        bool output_time_major = false;
++
++        if (rank == 4) {
++            n_state = shape[1].longLongValue;
++            n_out_ctx = shape[3].longLongValue;
++        } else if (rank == 3) {
++            if (shape[1].longLongValue == model_out_ctx) {
++                n_out_ctx = shape[1].longLongValue;
++                n_state = shape[2].longLongValue;
++                output_time_major = true;
++            } else {
++                n_state = shape[1].longLongValue;
++                n_out_ctx = shape[2].longLongValue;
++            }
++        }
++
++        const bool output_f16 = outMultiArray.dataType == MLMultiArrayDataTypeFloat16;
++        const uint16_t * out_f16 = (const uint16_t *) outMultiArray.dataPointer;
++        const float * out_f32 = (const float *) outMultiArray.dataPointer;
++
++        n_out_ctx = std::min(n_out_ctx, requested_out_ctx);
++
++        for (int64_t t = 0; t < n_out_ctx; ++t) {
++            for (int64_t s = 0; s < n_state; ++s) {
++                int64_t offset = s + t*n_state;
++
++                if (rank == 4) {
++                    offset =
++                        0*strides[0].longLongValue +
++                        s*strides[1].longLongValue +
++                        0*strides[2].longLongValue +
++                        t*strides[3].longLongValue;
++                } else if (rank == 3) {
++                    if (output_time_major) {
++                        offset =
++                            0*strides[0].longLongValue +
++                            t*strides[1].longLongValue +
++                            s*strides[2].longLongValue;
++                    } else {
++                        offset =
++                            0*strides[0].longLongValue +
++                            s*strides[1].longLongValue +
++                            t*strides[2].longLongValue;
++                    }
++                }
++
++                out[s + t*n_state] = output_f16 ? whisper_f16_bits_to_f32(out_f16[offset]) : out_f32[offset];
++            }
++        }
+     }
+ }
+ 

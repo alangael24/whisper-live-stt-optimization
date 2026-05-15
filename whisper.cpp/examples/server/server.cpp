@@ -1196,10 +1196,12 @@ int main(int argc, char ** argv) {
     // Body format: signed 16-bit little-endian mono PCM at WHISPER_SAMPLE_RATE.
     // Parameters are query string values, e.g. /inference-pcm?language=es&audio_ctx=256.
     svr->Post(sparams.request_path + sparams.inference_path + "-pcm", [&](const Request &req, Response &res){
+        const auto request_started = std::chrono::steady_clock::now();
         std::lock_guard<std::mutex> lock(whisper_mutex);
 
         whisper_params request_params = default_params;
         get_query_parameters(req, request_params);
+        const bool include_timings = req.has_param("timings") && parse_str_to_bool(req.get_param_value("timings"));
 
         std::vector<float> pcmf32;
         std::vector<std::vector<float>> pcmf32s;
@@ -1242,6 +1244,7 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "\n");
         }
 
+        struct whisper_timings * timings = nullptr;
         {
             printf("Running whisper.cpp inference on %s\n", filename.c_str());
             whisper_full_params wparams = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
@@ -1305,6 +1308,10 @@ int main(int argc, char ** argv) {
             };
             wparams.abort_callback_user_data = (void*)&req;
 
+            if (include_timings) {
+                whisper_reset_timings(ctx);
+            }
+
             if (whisper_full_parallel(ctx, wparams, pcmf32.data(), pcmf32.size(), request_params.n_processors) != 0) {
                 if (req.is_connection_closed()) {
                     fprintf(stderr, "client disconnected, aborted processing\n");
@@ -1317,6 +1324,10 @@ int main(int argc, char ** argv) {
                 res.set_content("{\"error\":\"failed to process audio\"}", "application/json");
                 return;
             }
+
+            if (include_timings) {
+                timings = whisper_get_timings(ctx);
+            }
         }
 
         std::string results = output_str(ctx, request_params, pcmf32s);
@@ -1326,6 +1337,34 @@ int main(int argc, char ** argv) {
             json jres = json{
                 {"text", results}
             };
+            if (timings) {
+                const auto request_finished = std::chrono::steady_clock::now();
+                const double e2e_ms = std::chrono::duration<double, std::milli>(
+                    request_finished - request_started
+                ).count();
+                const double postprocess_ms = std::max(0.0, e2e_ms - static_cast<double>(timings->total_ms));
+                const double overhead_ms = std::max(
+                    0.0,
+                    e2e_ms - static_cast<double>(timings->encode_total_ms) - static_cast<double>(timings->decode_total_ms)
+                );
+                jres["timings"] = json{
+                    {"mel_ms", timings->mel_total_ms},
+                    {"encode_ms", timings->encode_total_ms},
+                    {"decode_ms", timings->decode_total_ms},
+                    {"sample_ms", timings->sample_total_ms},
+                    {"batchd_ms", timings->batchd_total_ms},
+                    {"prompt_ms", timings->prompt_total_ms},
+                    {"whisper_total_ms", timings->total_ms},
+                    {"postprocess_ms", postprocess_ms},
+                    {"overhead_ms", overhead_ms},
+                    {"e2e_ms", e2e_ms},
+                    {"encode_per_run_ms", timings->encode_ms},
+                    {"decode_per_run_ms", timings->decode_ms},
+                    {"sample_per_run_ms", timings->sample_ms}
+                };
+                delete timings;
+                timings = nullptr;
+            }
             res.set_content(jres.dump(-1, ' ', false, json::error_handler_t::replace),
                             "application/json");
         }

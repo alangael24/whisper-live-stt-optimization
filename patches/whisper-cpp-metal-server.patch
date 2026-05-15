@@ -1,5 +1,5 @@
 diff --git a/examples/server/server.cpp b/examples/server/server.cpp
-index 08c0988d..30825e76 100644
+index 08c0988d..2a0dd2d4 100644
 --- a/examples/server/server.cpp
 +++ b/examples/server/server.cpp
 @@ -9,6 +9,7 @@
@@ -108,7 +108,7 @@ index 08c0988d..30825e76 100644
              wparams.split_on_word    = params.split_on_word;
              wparams.audio_ctx        = params.audio_ctx;
  
-@@ -1131,6 +1188,149 @@ int main(int argc, char ** argv) {
+@@ -1131,6 +1188,188 @@ int main(int argc, char ** argv) {
          // reset params to their defaults
          params = default_params;
      });
@@ -120,10 +120,12 @@ index 08c0988d..30825e76 100644
 +    // Body format: signed 16-bit little-endian mono PCM at WHISPER_SAMPLE_RATE.
 +    // Parameters are query string values, e.g. /inference-pcm?language=es&audio_ctx=256.
 +    svr->Post(sparams.request_path + sparams.inference_path + "-pcm", [&](const Request &req, Response &res){
++        const auto request_started = std::chrono::steady_clock::now();
 +        std::lock_guard<std::mutex> lock(whisper_mutex);
 +
 +        whisper_params request_params = default_params;
 +        get_query_parameters(req, request_params);
++        const bool include_timings = req.has_param("timings") && parse_str_to_bool(req.get_param_value("timings"));
 +
 +        std::vector<float> pcmf32;
 +        std::vector<std::vector<float>> pcmf32s;
@@ -166,6 +168,7 @@ index 08c0988d..30825e76 100644
 +            fprintf(stderr, "\n");
 +        }
 +
++        struct whisper_timings * timings = nullptr;
 +        {
 +            printf("Running whisper.cpp inference on %s\n", filename.c_str());
 +            whisper_full_params wparams = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
@@ -229,6 +232,10 @@ index 08c0988d..30825e76 100644
 +            };
 +            wparams.abort_callback_user_data = (void*)&req;
 +
++            if (include_timings) {
++                whisper_reset_timings(ctx);
++            }
++
 +            if (whisper_full_parallel(ctx, wparams, pcmf32.data(), pcmf32.size(), request_params.n_processors) != 0) {
 +                if (req.is_connection_closed()) {
 +                    fprintf(stderr, "client disconnected, aborted processing\n");
@@ -241,6 +248,10 @@ index 08c0988d..30825e76 100644
 +                res.set_content("{\"error\":\"failed to process audio\"}", "application/json");
 +                return;
 +            }
++
++            if (include_timings) {
++                timings = whisper_get_timings(ctx);
++            }
 +        }
 +
 +        std::string results = output_str(ctx, request_params, pcmf32s);
@@ -250,6 +261,34 @@ index 08c0988d..30825e76 100644
 +            json jres = json{
 +                {"text", results}
 +            };
++            if (timings) {
++                const auto request_finished = std::chrono::steady_clock::now();
++                const double e2e_ms = std::chrono::duration<double, std::milli>(
++                    request_finished - request_started
++                ).count();
++                const double postprocess_ms = std::max(0.0, e2e_ms - static_cast<double>(timings->total_ms));
++                const double overhead_ms = std::max(
++                    0.0,
++                    e2e_ms - static_cast<double>(timings->encode_total_ms) - static_cast<double>(timings->decode_total_ms)
++                );
++                jres["timings"] = json{
++                    {"mel_ms", timings->mel_total_ms},
++                    {"encode_ms", timings->encode_total_ms},
++                    {"decode_ms", timings->decode_total_ms},
++                    {"sample_ms", timings->sample_total_ms},
++                    {"batchd_ms", timings->batchd_total_ms},
++                    {"prompt_ms", timings->prompt_total_ms},
++                    {"whisper_total_ms", timings->total_ms},
++                    {"postprocess_ms", postprocess_ms},
++                    {"overhead_ms", overhead_ms},
++                    {"e2e_ms", e2e_ms},
++                    {"encode_per_run_ms", timings->encode_ms},
++                    {"decode_per_run_ms", timings->decode_ms},
++                    {"sample_per_run_ms", timings->sample_ms}
++                };
++                delete timings;
++                timings = nullptr;
++            }
 +            res.set_content(jres.dump(-1, ' ', false, json::error_handler_t::replace),
 +                            "application/json");
 +        }
@@ -380,6 +419,24 @@ index c372eaed..1637e3b9 100644
  // F == 1 : rms_norm (no fuse)
  // F == 2 : rms_norm + mul
  // F == 3 : rms_norm + mul + add
+diff --git a/include/whisper.h b/include/whisper.h
+index b5dcdb29..b79b428e 100644
+--- a/include/whisper.h
++++ b/include/whisper.h
+@@ -441,6 +441,13 @@ extern "C" {
+         float decode_ms;
+         float batchd_ms;
+         float prompt_ms;
++        float mel_total_ms;
++        float sample_total_ms;
++        float encode_total_ms;
++        float decode_total_ms;
++        float batchd_total_ms;
++        float prompt_total_ms;
++        float total_ms;
+     };
+     WHISPER_API struct whisper_timings * whisper_get_timings(struct whisper_context * ctx);
+     WHISPER_API void whisper_print_timings(struct whisper_context * ctx);
 diff --git a/src/coreml/whisper-encoder.mm b/src/coreml/whisper-encoder.mm
 index 81a5a6aa..718c0a9a 100644
 --- a/src/coreml/whisper-encoder.mm
@@ -639,5 +696,30 @@ index 81a5a6aa..718c0a9a 100644
 +            }
 +        }
      }
+ }
+ 
+diff --git a/src/whisper.cpp b/src/whisper.cpp
+index 6176d21f..7aa34db4 100644
+--- a/src/whisper.cpp
++++ b/src/whisper.cpp
+@@ -4246,12 +4246,20 @@ struct whisper_timings * whisper_get_timings(struct whisper_context * ctx) {
+     if (ctx->state == nullptr) {
+         return nullptr;
+     }
++    const int64_t t_end_us = ggml_time_us();
+     whisper_timings * timings = new whisper_timings;
+     timings->sample_ms = 1e-3f * ctx->state->t_sample_us / std::max(1, ctx->state->n_sample);
+     timings->encode_ms = 1e-3f * ctx->state->t_encode_us / std::max(1, ctx->state->n_encode);
+     timings->decode_ms = 1e-3f * ctx->state->t_decode_us / std::max(1, ctx->state->n_decode);
+     timings->batchd_ms = 1e-3f * ctx->state->t_batchd_us / std::max(1, ctx->state->n_batchd);
+     timings->prompt_ms = 1e-3f * ctx->state->t_prompt_us / std::max(1, ctx->state->n_prompt);
++    timings->mel_total_ms = 1e-3f * ctx->state->t_mel_us;
++    timings->sample_total_ms = 1e-3f * ctx->state->t_sample_us;
++    timings->encode_total_ms = 1e-3f * ctx->state->t_encode_us;
++    timings->decode_total_ms = 1e-3f * ctx->state->t_decode_us;
++    timings->batchd_total_ms = 1e-3f * ctx->state->t_batchd_us;
++    timings->prompt_total_ms = 1e-3f * ctx->state->t_prompt_us;
++    timings->total_ms = 1e-3f * (t_end_us - ctx->t_start_us);
+     return timings;
  }
  

@@ -11,6 +11,7 @@ live STT con `whisper.cpp` + backend local.
 - Binario activo: `/Users/alan/whisper.cpp/build-metal-current/bin/whisper-server`
 - Test page: `http://127.0.0.1:8080/test/transcribe`
 - Endpoint rapido C++ PCM: `http://127.0.0.1:50061/inference-pcm`
+- Gate de encoder/decode: `scripts/bench_pcm_gate.py`
 
 Ultima medicion registrada:
 
@@ -25,6 +26,22 @@ Ultima medicion registrada:
   "rtf": 0.163,
   "speculative": false
 }
+```
+
+Ultimo gate directo a `/inference-pcm?timings=true` con `audio_ctx=256`,
+20 runs y 2 warmups:
+
+```text
+mel_ms: p50=6.71 p95=7.71
+encode_ms: p50=265.07 p95=272.74 gate<=70.00 FAIL
+decode_ms: p50=107.23 p95=110.74 gate<=15.00 FAIL
+sample_ms: p50=15.75 p95=17.23
+batchd_ms: p50=8.68 p95=9.78
+prompt_ms: p50=0.00 p95=0.00
+postprocess_ms: p50=0.14 p95=0.32
+overhead_ms: p50=33.85 p95=37.73 gate<=15.00 FAIL
+e2e_ms: p50=407.50 p95=415.33 gate<=100.00 FAIL
+client_e2e_ms: p50=408.86 p95=416.28
 ```
 
 ## Layout
@@ -43,7 +60,9 @@ whisper.cpp/
   examples/server/server.cpp
   ggml/src/ggml-metal/ggml-metal-device.cpp
   ggml/src/ggml-metal/ggml-metal.metal
+  include/whisper.h
   src/coreml/whisper-encoder.mm
+  src/whisper.cpp
 
 patches/
   ai-inbound-backend-whisper-live.patch
@@ -51,6 +70,7 @@ patches/
 
 scripts/
   bench_live_ws.py
+  bench_pcm_gate.py
 ```
 
 ## Aplicar patches
@@ -124,6 +144,21 @@ curl -sS -w '\nTIME:%{time_total}\n' \
   'http://127.0.0.1:50061/inference-pcm?language=es&temperature=0&temperature_inc=0&response_format=json&no_timestamps=true&beam_size=1&best_of=1&audio_ctx=256&max_context=0&max_len=40' \
   -H 'Content-Type: application/octet-stream' \
   --data-binary @/tmp/transcribe-test.pcm
+```
+
+Gate de encoder/decode/e2e usando timings internos del endpoint PCM:
+
+```sh
+/Users/alan/ai-inbound-backend/.venv/bin/python scripts/bench_pcm_gate.py --runs 20 --warmup 2
+```
+
+El gate falla si:
+
+```text
+encode_p95_ms > 70
+decode_p95_ms > 15
+overhead_p95_ms > 15
+e2e_p95_ms > 100
 ```
 
 Flujo live WebSocket:

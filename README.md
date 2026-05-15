@@ -10,6 +10,7 @@ live STT con `whisper.cpp` + backend local.
 - Modelo: `ggml-large-v3-turbo.bin`
 - Binario activo: `/Users/alan/whisper.cpp/build-metal-current/bin/whisper-server`
 - Test page: `http://127.0.0.1:8080/test/transcribe`
+- Endpoint rapido C++ PCM: `http://127.0.0.1:50061/inference-pcm`
 
 Ultima medicion registrada:
 
@@ -17,11 +18,11 @@ Ultima medicion registrada:
 {
   "text": "Me llamo Alan y necesito reparar una fuga hoy.",
   "audio_ms": 2828,
-  "since_start_ms": 3840,
-  "after_audio_ms": 770,
-  "inference_ms": 736,
-  "delivery_ms": 769,
-  "rtf": 0.26,
+  "since_start_ms": 3569,
+  "after_audio_ms": 506,
+  "inference_ms": 460,
+  "delivery_ms": 504,
+  "rtf": 0.163,
   "speculative": false
 }
 ```
@@ -87,12 +88,16 @@ Backend:
 
 ```sh
 cd /Users/alan/ai-inbound-backend
-PUBLIC_DEMO_ONLY=false KEEPALIVE_ENABLED=false .venv/bin/python server.py
+STT_SERVER_URL=http://127.0.0.1:50061/inference-pcm \
+STT_FINAL_SERVER_URL=http://127.0.0.1:50061/inference-pcm \
+PUBLIC_DEMO_ONLY=false \
+KEEPALIVE_ENABLED=false \
+.venv/bin/python server.py
 ```
 
 ## Benchmark
 
-Directo a Whisper:
+Directo a Whisper con multipart WAV:
 
 ```sh
 curl -sS -w '\nTIME:%{time_total}\n' http://127.0.0.1:50061/inference \
@@ -108,6 +113,17 @@ curl -sS -w '\nTIME:%{time_total}\n' http://127.0.0.1:50061/inference \
   -F audio_ctx=256 \
   -F max_context=0 \
   -F max_len=40
+```
+
+Directo a Whisper con PCM crudo:
+
+```sh
+python -c 'import wave; src="/Users/alan/ai-inbound-backend/data/audio/TRANSCRIBE_TEST-986b6dc2.wav"; dst="/tmp/transcribe-test.pcm"; w=wave.open(src,"rb"); open(dst,"wb").write(w.readframes(w.getnframes()))'
+
+curl -sS -w '\nTIME:%{time_total}\n' \
+  'http://127.0.0.1:50061/inference-pcm?language=es&temperature=0&temperature_inc=0&response_format=json&no_timestamps=true&beam_size=1&best_of=1&audio_ctx=256&max_context=0&max_len=40' \
+  -H 'Content-Type: application/octet-stream' \
+  --data-binary @/tmp/transcribe-test.pcm
 ```
 
 Flujo live WebSocket:
@@ -126,6 +142,6 @@ cd /Users/alan/ai-inbound-backend
 Ultimo resultado:
 
 ```text
-Ran 40 tests in 0.429s
+Ran 41 tests in 0.433s
 OK
 ```

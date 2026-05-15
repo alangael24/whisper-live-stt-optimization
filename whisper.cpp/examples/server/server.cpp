@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdint>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -630,6 +631,54 @@ void get_req_parameters(const Request & req, whisper_params & params)
     }
 }
 
+void get_query_parameters(const Request & req, whisper_params & params)
+{
+    if (req.has_param("offset_t"))               { params.offset_t_ms     = std::stoi(req.get_param_value("offset_t")); }
+    if (req.has_param("offset_n"))               { params.offset_n        = std::stoi(req.get_param_value("offset_n")); }
+    if (req.has_param("duration"))               { params.duration_ms     = std::stoi(req.get_param_value("duration")); }
+    if (req.has_param("max_context"))            { params.max_context     = std::stoi(req.get_param_value("max_context")); }
+    if (req.has_param("max_len"))                { params.max_len         = std::stoi(req.get_param_value("max_len")); }
+    if (req.has_param("max_tokens"))             { params.max_tokens      = std::stoi(req.get_param_value("max_tokens")); }
+    if (req.has_param("best_of"))                { params.best_of         = std::stoi(req.get_param_value("best_of")); }
+    if (req.has_param("beam_size"))              { params.beam_size       = std::stoi(req.get_param_value("beam_size")); }
+    if (req.has_param("audio_ctx"))              { params.audio_ctx       = std::stoi(req.get_param_value("audio_ctx")); }
+    if (req.has_param("word_thold"))             { params.word_thold      = std::stof(req.get_param_value("word_thold")); }
+    if (req.has_param("entropy_thold"))          { params.entropy_thold   = std::stof(req.get_param_value("entropy_thold")); }
+    if (req.has_param("logprob_thold"))          { params.logprob_thold   = std::stof(req.get_param_value("logprob_thold")); }
+    if (req.has_param("debug_mode"))             { params.debug_mode      = parse_str_to_bool(req.get_param_value("debug_mode")); }
+    if (req.has_param("translate"))              { params.translate       = parse_str_to_bool(req.get_param_value("translate")); }
+    if (req.has_param("diarize"))                { params.diarize         = parse_str_to_bool(req.get_param_value("diarize")); }
+    if (req.has_param("tinydiarize"))            { params.tinydiarize     = parse_str_to_bool(req.get_param_value("tinydiarize")); }
+    if (req.has_param("split_on_word"))          { params.split_on_word   = parse_str_to_bool(req.get_param_value("split_on_word")); }
+    if (req.has_param("no_timestamps"))          { params.no_timestamps   = parse_str_to_bool(req.get_param_value("no_timestamps")); }
+    if (req.has_param("token_timestamps"))       { params.token_timestamps = parse_str_to_bool(req.get_param_value("token_timestamps")); }
+    else                                         { params.token_timestamps = !params.no_timestamps; }
+    if (req.has_param("language"))               { params.language        = req.get_param_value("language"); }
+    if (req.has_param("detect_language"))        { params.detect_language = parse_str_to_bool(req.get_param_value("detect_language")); }
+    if (req.has_param("prompt"))                 { params.prompt          = req.get_param_value("prompt"); }
+    if (req.has_param("response_format"))        { params.response_format = req.get_param_value("response_format"); }
+    if (req.has_param("temperature"))            { params.temperature     = std::stof(req.get_param_value("temperature")); }
+    if (req.has_param("temperature_inc"))        { params.temperature_inc = std::stof(req.get_param_value("temperature_inc")); }
+    if (req.has_param("suppress_non_speech"))    { params.suppress_nst    = parse_str_to_bool(req.get_param_value("suppress_non_speech")); }
+    if (req.has_param("suppress_nst"))           { params.suppress_nst    = parse_str_to_bool(req.get_param_value("suppress_nst")); }
+    if (req.has_param("no_language_probabilities")) { params.no_language_probabilities = parse_str_to_bool(req.get_param_value("no_language_probabilities")); }
+}
+
+bool pcm_s16le_to_f32(const std::string & body, std::vector<float> & pcmf32)
+{
+    if (body.empty() || body.size() % sizeof(int16_t) != 0) {
+        return false;
+    }
+    pcmf32.resize(body.size() / sizeof(int16_t));
+    for (size_t i = 0; i < pcmf32.size(); ++i) {
+        const uint8_t lo = static_cast<uint8_t>(body[2*i + 0]);
+        const uint8_t hi = static_cast<uint8_t>(body[2*i + 1]);
+        const int16_t sample = static_cast<int16_t>(lo | (hi << 8));
+        pcmf32[i] = sample / 32768.0f;
+    }
+    return true;
+}
+
 }  // namespace
 
 int main(int argc, char ** argv) {
@@ -1139,6 +1188,149 @@ int main(int argc, char ** argv) {
         // reset params to their defaults
         params = default_params;
     });
+
+    svr->Options(sparams.request_path + sparams.inference_path + "-pcm", [&](const Request &, Response &){
+    });
+
+    // Raw PCM fast path for local low-latency clients.
+    // Body format: signed 16-bit little-endian mono PCM at WHISPER_SAMPLE_RATE.
+    // Parameters are query string values, e.g. /inference-pcm?language=es&audio_ctx=256.
+    svr->Post(sparams.request_path + sparams.inference_path + "-pcm", [&](const Request &req, Response &res){
+        std::lock_guard<std::mutex> lock(whisper_mutex);
+
+        whisper_params request_params = default_params;
+        get_query_parameters(req, request_params);
+
+        std::vector<float> pcmf32;
+        std::vector<std::vector<float>> pcmf32s;
+        if (!pcm_s16le_to_f32(req.body, pcmf32)) {
+            fprintf(stderr, "error: invalid raw PCM body\n");
+            res.status = 400;
+            res.set_content("{\"error\":\"invalid raw PCM body; expected signed 16-bit little-endian mono PCM\"}", "application/json");
+            return;
+        }
+
+        const std::string filename = "raw-pcm";
+        printf("Received PCM request: %zu samples\n", pcmf32.size());
+
+        {
+            fprintf(stderr, "\n");
+            fprintf(stderr, "system_info: n_threads = %d / %d | %s\n",
+                    request_params.n_threads*request_params.n_processors, std::thread::hardware_concurrency(), whisper_print_system_info());
+        }
+
+        {
+            fprintf(stderr, "\n");
+            if (!whisper_is_multilingual(ctx)) {
+                if (request_params.language != "en" || request_params.translate) {
+                    request_params.language = "en";
+                    request_params.translate = false;
+                    fprintf(stderr, "%s: WARNING: model is not multilingual, ignoring language and translation options\n", __func__);
+                }
+            }
+            if (request_params.detect_language) {
+                request_params.language = "auto";
+            }
+            fprintf(stderr, "%s: processing '%s' (%d samples, %.1f sec), %d threads, %d processors, lang = %s, task = %s, %stimestamps = %d ...\n",
+                    __func__, filename.c_str(), int(pcmf32.size()), float(pcmf32.size())/WHISPER_SAMPLE_RATE,
+                    request_params.n_threads, request_params.n_processors,
+                    request_params.language.c_str(),
+                    request_params.translate ? "translate" : "transcribe",
+                    request_params.tinydiarize ? "tdrz = 1, " : "",
+                    request_params.no_timestamps ? 0 : 1);
+
+            fprintf(stderr, "\n");
+        }
+
+        {
+            printf("Running whisper.cpp inference on %s\n", filename.c_str());
+            whisper_full_params wparams = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
+
+            wparams.strategy = request_params.beam_size > 1 ? WHISPER_SAMPLING_BEAM_SEARCH : WHISPER_SAMPLING_GREEDY;
+
+            wparams.print_realtime   = false;
+            wparams.print_progress   = request_params.print_progress;
+            wparams.print_timestamps = !request_params.no_timestamps;
+            wparams.print_special    = request_params.print_special;
+            wparams.translate        = request_params.translate;
+            wparams.language         = request_params.language.c_str();
+            wparams.detect_language  = request_params.detect_language;
+            wparams.n_threads        = request_params.n_threads;
+            wparams.n_max_text_ctx   = request_params.max_context >= 0 ? request_params.max_context : wparams.n_max_text_ctx;
+            wparams.offset_ms        = request_params.offset_t_ms;
+            wparams.duration_ms      = request_params.duration_ms;
+
+            wparams.thold_pt         = request_params.word_thold;
+            wparams.max_len          = request_params.max_len == 0 ? 60 : request_params.max_len;
+            wparams.max_tokens       = request_params.max_tokens;
+            wparams.split_on_word    = request_params.split_on_word;
+            wparams.audio_ctx        = request_params.audio_ctx;
+
+            wparams.debug_mode       = request_params.debug_mode;
+
+            wparams.tdrz_enable      = request_params.tinydiarize;
+
+            wparams.initial_prompt   = request_params.prompt.c_str();
+
+            wparams.greedy.best_of        = request_params.best_of;
+            wparams.beam_search.beam_size = request_params.beam_size;
+
+            wparams.temperature      = request_params.temperature;
+            wparams.no_speech_thold  = request_params.no_speech_thold;
+            wparams.temperature_inc  = request_params.temperature_inc;
+            wparams.entropy_thold    = request_params.entropy_thold;
+            wparams.logprob_thold    = request_params.logprob_thold;
+
+            wparams.no_timestamps    = request_params.no_timestamps;
+            wparams.token_timestamps = request_params.token_timestamps;
+            wparams.no_context       = request_params.no_context;
+
+            wparams.suppress_nst     = request_params.suppress_nst;
+
+            whisper_print_user_data user_data = { &request_params, &pcmf32s, 0 };
+
+            if (request_params.print_realtime) {
+                wparams.new_segment_callback           = whisper_print_segment_callback;
+                wparams.new_segment_callback_user_data = &user_data;
+            }
+
+            if (wparams.print_progress) {
+                wparams.progress_callback           = whisper_print_progress_callback;
+                wparams.progress_callback_user_data = &user_data;
+            }
+
+            wparams.abort_callback = [](void *user_data) {
+                auto req_ptr = static_cast<const httplib::Request*>(user_data);
+                return req_ptr->is_connection_closed();
+            };
+            wparams.abort_callback_user_data = (void*)&req;
+
+            if (whisper_full_parallel(ctx, wparams, pcmf32.data(), pcmf32.size(), request_params.n_processors) != 0) {
+                if (req.is_connection_closed()) {
+                    fprintf(stderr, "client disconnected, aborted processing\n");
+                    res.status = 499;
+                    res.set_content("{\"error\":\"client disconnected\"}", "application/json");
+                    return;
+                }
+                fprintf(stderr, "%s: failed to process raw PCM\n", argv[0]);
+                res.status = 500;
+                res.set_content("{\"error\":\"failed to process audio\"}", "application/json");
+                return;
+            }
+        }
+
+        std::string results = output_str(ctx, request_params, pcmf32s);
+        if (request_params.response_format == text_format) {
+            res.set_content(results.c_str(), "text/html; charset=utf-8");
+        } else {
+            json jres = json{
+                {"text", results}
+            };
+            res.set_content(jres.dump(-1, ' ', false, json::error_handler_t::replace),
+                            "application/json");
+        }
+    });
+
     svr->Post(sparams.request_path + "/load", [&](const Request &req, Response &res){
         std::lock_guard<std::mutex> lock(whisper_mutex);
         state.store(SERVER_STATE_LOADING_MODEL);

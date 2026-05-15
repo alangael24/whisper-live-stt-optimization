@@ -59,6 +59,21 @@ class AudioSttTests(unittest.TestCase):
 
         self.assertEqual(audio_ctx, 256)
 
+    def test_whisper_cpp_pcm_audio_ctx_uses_short_context_for_live_windows(self):
+        with tempfile.NamedTemporaryFile(suffix=".wav") as tmp:
+            with wave.open(tmp.name, "wb") as wav:
+                wav.setnchannels(1)
+                wav.setsampwidth(2)
+                wav.setframerate(16000)
+                wav.writeframes(b"\0\0" * int(16000 * 1.5))
+
+            audio_ctx = whisper_cpp_audio_ctx_for_file(
+                tmp.name,
+                "http://127.0.0.1:50061/inference-pcm",
+            )
+
+        self.assertEqual(audio_ctx, 256)
+
     def test_whisper_cpp_audio_ctx_skips_subsecond_audio(self):
         with tempfile.NamedTemporaryFile(suffix=".wav") as tmp:
             with wave.open(tmp.name, "wb") as wav:

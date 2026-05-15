@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict
 from urllib.error import HTTPError, URLError
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlencode, urljoin, urlparse
 from urllib.request import Request, urlopen
 
 from .asterisk_agi import clean_transcript, render_command, run_command, safe_basename
@@ -114,6 +114,14 @@ def transcribe_with_server(
             configured=False,
             error="STT_SERVER_URL is not configured",
         )
+    if _is_whisper_cpp_pcm_url(stt_server_url):
+        return transcribe_with_pcm_server(
+            audio_file,
+            stt_server_url,
+            language,
+            prompt,
+            audio_ctx,
+        )
 
     boundary = "----ai-inbound-" + uuid.uuid4().hex
     whisper_cpp_server = _is_whisper_cpp_inference_url(stt_server_url)
@@ -179,6 +187,80 @@ def transcribe_with_server(
     )
 
 
+def transcribe_with_pcm_server(
+    audio_file: str,
+    stt_server_url: str,
+    language: str = "es",
+    prompt: str = "",
+    audio_ctx: int = 0,
+) -> TranscriptionResult:
+    try:
+        with wave.open(audio_file, "rb") as wav:
+            if wav.getframerate() != 16000 or wav.getnchannels() != 1 or wav.getsampwidth() != 2:
+                return TranscriptionResult(
+                    transcript="",
+                    audio_file=audio_file,
+                    configured=True,
+                    error="PCM endpoint requires 16 kHz mono signed 16-bit WAV input",
+                )
+            body = wav.readframes(wav.getnframes())
+    except (OSError, EOFError, wave.Error) as exc:
+        return TranscriptionResult(
+            transcript="",
+            audio_file=audio_file,
+            configured=True,
+            error=str(exc),
+        )
+
+    fields = {
+        "language": language,
+        "temperature": "0",
+        "temperature_inc": "0",
+        "response_format": "json",
+        "no_timestamps": "true",
+        "beam_size": "1",
+        "best_of": "1",
+        "max_context": "0",
+        "max_len": "40",
+        "prompt": prompt[-300:],
+    }
+    if audio_ctx > 0:
+        fields["audio_ctx"] = str(audio_ctx)
+    query = urlencode({key: value for key, value in fields.items() if value != ""})
+    url = _transcription_url(stt_server_url)
+    if query:
+        url += ("&" if "?" in url else "?") + query
+    request = Request(
+        url,
+        data=body,
+        headers={
+            "Content-Type": "application/octet-stream",
+            "Content-Length": str(len(body)),
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=120) as response:
+            raw = response.read().decode("utf-8")
+    except (HTTPError, URLError, OSError) as exc:
+        return TranscriptionResult(
+            transcript="",
+            audio_file=audio_file,
+            configured=True,
+            error=str(exc),
+        )
+
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        payload = {"text": raw}
+    return TranscriptionResult(
+        transcript=clean_transcript(strip_whisper_noise(_server_text(payload))),
+        audio_file=audio_file,
+        configured=True,
+    )
+
+
 def transcribe_audio(
     audio_file: str,
     stt_command: str,
@@ -207,7 +289,7 @@ def transcribe_audio(
 
 
 def whisper_cpp_audio_ctx_for_file(audio_file: str, stt_server_url: str) -> int:
-    if not _is_whisper_cpp_inference_url(stt_server_url):
+    if not _is_whisper_cpp_url(stt_server_url):
         return 0
     duration = wav_duration_seconds(audio_file)
     if duration < 1.0:
@@ -261,7 +343,7 @@ def _should_retry_full_context(text: str, duration_seconds: float) -> bool:
 
 def _transcription_url(stt_server_url: str) -> str:
     trimmed = stt_server_url.rstrip("/")
-    if _is_whisper_cpp_inference_url(trimmed):
+    if _is_whisper_cpp_url(trimmed):
         return trimmed
     if trimmed.endswith("/v1/audio/transcriptions"):
         return trimmed
@@ -273,6 +355,17 @@ def _transcription_url(stt_server_url: str) -> str:
 def _is_whisper_cpp_inference_url(stt_server_url: str) -> bool:
     path = urlparse(stt_server_url.strip()).path.rstrip("/")
     return path.endswith("/inference")
+
+
+def _is_whisper_cpp_pcm_url(stt_server_url: str) -> bool:
+    path = urlparse(stt_server_url.strip()).path.rstrip("/")
+    return path.endswith("/inference-pcm")
+
+
+def _is_whisper_cpp_url(stt_server_url: str) -> bool:
+    return _is_whisper_cpp_inference_url(stt_server_url) or _is_whisper_cpp_pcm_url(
+        stt_server_url
+    )
 
 
 def _multipart_body(

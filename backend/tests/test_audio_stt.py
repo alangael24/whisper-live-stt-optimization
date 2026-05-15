@@ -133,6 +133,24 @@ class AudioSttTests(unittest.TestCase):
         self.assertEqual(final_text, "Me llamo Alan")
         self.assertEqual(delta, "")
 
+    def test_live_state_dedupes_confirmed_suffix_after_filler(self):
+        state = TranscriptState("Me llamo Alan y necesito reparar")
+
+        final_text, delta = state.commit_final_delta("ok necesito reparar una fuga hoy")
+
+        self.assertEqual(final_text, "Me llamo Alan y necesito reparar una fuga hoy")
+        self.assertEqual(delta, "una fuga hoy")
+
+    def test_live_state_dedupes_ordered_overlap_with_missing_word(self):
+        state = TranscriptState("Me llamo Alan y necesito reparar")
+
+        final_text, delta = state.commit_final_delta(
+            "Me llamo Alan necesito reparar una fuga"
+        )
+
+        self.assertEqual(final_text, "Me llamo Alan y necesito reparar una fuga")
+        self.assertEqual(delta, "una fuga")
+
     def test_trim_pcm_for_stt_removes_outer_silence(self):
         silence_before = b"\0\0" * int(SAMPLE_RATE * 0.5)
         speech = (1000).to_bytes(2, "little", signed=True) * int(SAMPLE_RATE * 0.4)

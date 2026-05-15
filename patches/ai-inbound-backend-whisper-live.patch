@@ -161,7 +161,7 @@ index 4daf08f..4783c97 100644
      boundary: str,
      fields: Dict[str, str],
 diff --git a/inbound_ai/live_stt.py b/inbound_ai/live_stt.py
-index eab01ee..a208021 100644
+index eab01ee..e1e9e36 100644
 --- a/inbound_ai/live_stt.py
 +++ b/inbound_ai/live_stt.py
 @@ -8,10 +8,11 @@ import re
@@ -177,7 +177,7 @@ index eab01ee..a208021 100644
  
  from .audio_stt import transcribe_audio
  from .config import Settings
-@@ -19,12 +20,20 @@ from .config import Settings
+@@ -19,12 +20,23 @@ from .config import Settings
  
  SAMPLE_RATE = 16_000
  BYTES_PER_SAMPLE = 2
@@ -199,10 +199,13 @@ index eab01ee..a208021 100644
 +SPECULATIVE_MIN_NEW_AUDIO_SECONDS = 0.35
 +SPECULATIVE_REUSE_TOLERANCE_SECONDS = 0.45
 +SPECULATIVE_WAIT_SECONDS = 0.28
++DEDUP_SEARCH_WORDS = 80
++DEDUP_MIN_MATCH_WORDS = 2
++DEDUP_MAX_LEADING_FILLER_WORDS = 3
  
  
  class PcmRingBuffer:
-@@ -55,7 +64,8 @@ class PcmRingBuffer:
+@@ -55,7 +67,8 @@ class PcmRingBuffer:
                  if not self.in_speech:
                      self.utterance = bytearray(self.pre_roll)
                      self.in_speech = True
@@ -212,7 +215,7 @@ index eab01ee..a208021 100644
                  if len(self.utterance) > self.utterance_capacity:
                      del self.utterance[: len(self.utterance) - self.utterance_capacity]
                  self.last_speech_at = now
-@@ -76,19 +86,52 @@ class PcmRingBuffer:
+@@ -76,19 +89,52 @@ class PcmRingBuffer:
                      return b""
              utterance = bytes(self.utterance)
              self.utterance = bytearray()
@@ -267,7 +270,7 @@ index eab01ee..a208021 100644
  
  
  class LiveSttBridge:
-@@ -99,6 +142,12 @@ class LiveSttBridge:
+@@ -99,6 +145,12 @@ class LiveSttBridge:
          self.state = TranscriptState()
          self.closed = threading.Event()
          self.started_at = time.monotonic()
@@ -280,7 +283,7 @@ index eab01ee..a208021 100644
  
      def run(self) -> None:
          worker = threading.Thread(target=self._infer_loop, name="live-stt", daemon=True)
-@@ -139,10 +188,12 @@ class LiveSttBridge:
+@@ -139,10 +191,12 @@ class LiveSttBridge:
              self.closed.set()
          if event.get("type") == "reset":
              self.state = TranscriptState()
@@ -293,7 +296,7 @@ index eab01ee..a208021 100644
              self._maybe_finalize_on_silence()
  
      def _maybe_finalize_on_silence(self) -> None:
-@@ -154,7 +205,168 @@ class LiveSttBridge:
+@@ -154,7 +208,168 @@ class LiveSttBridge:
      def _transcribe_final_utterance(self, pcm: bytes) -> None:
          if len(pcm) < int(MIN_WINDOW_SECONDS * SAMPLE_RATE * BYTES_PER_SAMPLE):
              return
@@ -463,7 +466,7 @@ index eab01ee..a208021 100644
          try:
              started = time.perf_counter()
              result = transcribe_audio(
-@@ -171,25 +383,14 @@ class LiveSttBridge:
+@@ -171,25 +386,14 @@ class LiveSttBridge:
              except OSError:
                  pass
  
@@ -497,7 +500,7 @@ index eab01ee..a208021 100644
          )
  
      def _write_temp_wav(self, pcm: bytes, prefix: str) -> str:
-@@ -225,12 +426,49 @@ def pcm_rms(payload: bytes) -> float:
+@@ -225,12 +429,49 @@ def pcm_rms(payload: bytes) -> float:
      return math.sqrt(total / max(1, count))
  
  
@@ -548,9 +551,73 @@ index eab01ee..a208021 100644
  
  
  def remove_confirmed_overlap(hypothesis: str, final_text: str) -> str:
-@@ -248,9 +486,13 @@ def remove_confirmed_overlap(hypothesis: str, final_text: str) -> str:
+@@ -240,17 +481,76 @@ def remove_confirmed_overlap(hypothesis: str, final_text: str) -> str:
+         return " ".join(hyp_words)
+     hyp_norm = normalized_words(hypothesis)
+     final_norm = normalized_words(final_text)
+-    max_overlap = min(len(hyp_norm), len(final_norm), 30)
++    max_overlap = min(len(hyp_norm), len(final_norm), DEDUP_SEARCH_WORDS)
+     for size in range(max_overlap, 0, -1):
+         if final_norm[-size:] == hyp_norm[:size]:
+             return " ".join(hyp_words[size:])
++    contained_suffix_end = find_confirmed_suffix_inside_hypothesis(
++        final_norm,
++        hyp_norm,
++    )
++    if contained_suffix_end is not None:
++        return " ".join(hyp_words[contained_suffix_end:])
++    ordered_prefix_end = find_ordered_confirmed_prefix(
++        final_norm,
++        hyp_norm,
++    )
++    if ordered_prefix_end is not None:
++        return " ".join(hyp_words[ordered_prefix_end:])
+     return " ".join(hyp_words)
  
  
++def find_confirmed_suffix_inside_hypothesis(
++    final_norm: List[str],
++    hyp_norm: List[str],
++) -> Optional[int]:
++    max_overlap = min(len(hyp_norm), len(final_norm), DEDUP_SEARCH_WORDS)
++    for size in range(max_overlap, DEDUP_MIN_MATCH_WORDS - 1, -1):
++        suffix = final_norm[-size:]
++        for start in range(0, len(hyp_norm) - size + 1):
++            if hyp_norm[start : start + size] == suffix:
++                return start + size
++    return None
++
++
++def find_ordered_confirmed_prefix(
++    final_norm: List[str],
++    hyp_norm: List[str],
++) -> Optional[int]:
++    if len(final_norm) < DEDUP_MIN_MATCH_WORDS or len(hyp_norm) < DEDUP_MIN_MATCH_WORDS:
++        return None
++    final_tail = final_norm[-DEDUP_SEARCH_WORDS:]
++    max_start = min(DEDUP_MAX_LEADING_FILLER_WORDS, len(hyp_norm) - DEDUP_MIN_MATCH_WORDS)
++    best_end = None
++    best_count = 0
++    for hyp_start in range(max_start + 1):
++        final_index = 0
++        matched_positions: List[int] = []
++        for hyp_index in range(hyp_start, len(hyp_norm)):
++            try:
++                found_at = final_tail.index(hyp_norm[hyp_index], final_index)
++            except ValueError:
++                break
++            matched_positions.append(found_at)
++            final_index = found_at + 1
++        if len(matched_positions) < DEDUP_MIN_MATCH_WORDS:
++            continue
++        if matched_positions[-1] != len(final_tail) - 1:
++            continue
++        if len(matched_positions) > best_count:
++            best_count = len(matched_positions)
++            best_end = hyp_start + len(matched_positions)
++    return best_end
++
++
  def append_without_duplicate_overlap(existing: str, addition: str) -> str:
 +    return join_words(existing, remove_duplicate_prefix(existing, addition))
 +
@@ -563,7 +630,7 @@ index eab01ee..a208021 100644
      if not existing.strip():
          return addition
      existing_words = word_list(existing)
-@@ -260,5 +502,13 @@ def append_without_duplicate_overlap(existing: str, addition: str) -> str:
+@@ -260,5 +560,13 @@ def append_without_duplicate_overlap(existing: str, addition: str) -> str:
      max_overlap = min(len(existing_norm), len(addition_norm), 30)
      for size in range(max_overlap, 0, -1):
          if existing_norm[-size:] == addition_norm[:size]:
@@ -594,7 +661,7 @@ index 20e490c..3ca8d5e 100644
        if (data.rtf) meta.append(metaPill(`rtf ${data.rtf}`));
        entry.append(transcript, meta);
 diff --git a/tests/test_audio_stt.py b/tests/test_audio_stt.py
-index c070022..f5f9bb5 100644
+index c070022..27d900f 100644
 --- a/tests/test_audio_stt.py
 +++ b/tests/test_audio_stt.py
 @@ -1,13 +1,16 @@
@@ -615,7 +682,7 @@ index c070022..f5f9bb5 100644
  
  
  class AudioSttTests(unittest.TestCase):
-@@ -26,11 +29,127 @@ class AudioSttTests(unittest.TestCase):
+@@ -26,11 +29,145 @@ class AudioSttTests(unittest.TestCase):
          self.assertFalse(result.configured)
          self.assertEqual(result.transcript, "")
  
@@ -722,6 +789,24 @@ index c070022..f5f9bb5 100644
 +
 +        self.assertEqual(final_text, "Me llamo Alan")
 +        self.assertEqual(delta, "")
++
++    def test_live_state_dedupes_confirmed_suffix_after_filler(self):
++        state = TranscriptState("Me llamo Alan y necesito reparar")
++
++        final_text, delta = state.commit_final_delta("ok necesito reparar una fuga hoy")
++
++        self.assertEqual(final_text, "Me llamo Alan y necesito reparar una fuga hoy")
++        self.assertEqual(delta, "una fuga hoy")
++
++    def test_live_state_dedupes_ordered_overlap_with_missing_word(self):
++        state = TranscriptState("Me llamo Alan y necesito reparar")
++
++        final_text, delta = state.commit_final_delta(
++            "Me llamo Alan necesito reparar una fuga"
++        )
++
++        self.assertEqual(final_text, "Me llamo Alan y necesito reparar una fuga")
++        self.assertEqual(delta, "una fuga")
 +
 +    def test_trim_pcm_for_stt_removes_outer_silence(self):
 +        silence_before = b"\0\0" * int(SAMPLE_RATE * 0.5)

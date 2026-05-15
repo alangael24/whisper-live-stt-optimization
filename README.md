@@ -17,11 +17,11 @@ Ultima medicion registrada:
 {
   "text": "Me llamo Alan y necesito reparar una fuga hoy.",
   "audio_ms": 2828,
-  "since_start_ms": 3593,
-  "after_audio_ms": 492,
-  "inference_ms": 455,
-  "delivery_ms": 490,
-  "rtf": 0.161,
+  "since_start_ms": 3556,
+  "after_audio_ms": 486,
+  "inference_ms": 453,
+  "delivery_ms": 485,
+  "rtf": 0.16,
   "speculative": false
 }
 ```
@@ -126,6 +126,6 @@ cd /Users/alan/ai-inbound-backend
 Ultimo resultado:
 
 ```text
-Ran 36 tests in 0.424s
+Ran 38 tests in 0.445s
 OK
 ```

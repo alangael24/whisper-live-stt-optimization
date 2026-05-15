@@ -34,6 +34,9 @@ SPECULATIVE_INTERVAL_SECONDS = 0.55
 SPECULATIVE_MIN_NEW_AUDIO_SECONDS = 0.35
 SPECULATIVE_REUSE_TOLERANCE_SECONDS = 0.45
 SPECULATIVE_WAIT_SECONDS = 0.28
+DEDUP_SEARCH_WORDS = 80
+DEDUP_MIN_MATCH_WORDS = 2
+DEDUP_MAX_LEADING_FILLER_WORDS = 3
 
 
 class PcmRingBuffer:
@@ -478,11 +481,66 @@ def remove_confirmed_overlap(hypothesis: str, final_text: str) -> str:
         return " ".join(hyp_words)
     hyp_norm = normalized_words(hypothesis)
     final_norm = normalized_words(final_text)
-    max_overlap = min(len(hyp_norm), len(final_norm), 30)
+    max_overlap = min(len(hyp_norm), len(final_norm), DEDUP_SEARCH_WORDS)
     for size in range(max_overlap, 0, -1):
         if final_norm[-size:] == hyp_norm[:size]:
             return " ".join(hyp_words[size:])
+    contained_suffix_end = find_confirmed_suffix_inside_hypothesis(
+        final_norm,
+        hyp_norm,
+    )
+    if contained_suffix_end is not None:
+        return " ".join(hyp_words[contained_suffix_end:])
+    ordered_prefix_end = find_ordered_confirmed_prefix(
+        final_norm,
+        hyp_norm,
+    )
+    if ordered_prefix_end is not None:
+        return " ".join(hyp_words[ordered_prefix_end:])
     return " ".join(hyp_words)
+
+
+def find_confirmed_suffix_inside_hypothesis(
+    final_norm: List[str],
+    hyp_norm: List[str],
+) -> Optional[int]:
+    max_overlap = min(len(hyp_norm), len(final_norm), DEDUP_SEARCH_WORDS)
+    for size in range(max_overlap, DEDUP_MIN_MATCH_WORDS - 1, -1):
+        suffix = final_norm[-size:]
+        for start in range(0, len(hyp_norm) - size + 1):
+            if hyp_norm[start : start + size] == suffix:
+                return start + size
+    return None
+
+
+def find_ordered_confirmed_prefix(
+    final_norm: List[str],
+    hyp_norm: List[str],
+) -> Optional[int]:
+    if len(final_norm) < DEDUP_MIN_MATCH_WORDS or len(hyp_norm) < DEDUP_MIN_MATCH_WORDS:
+        return None
+    final_tail = final_norm[-DEDUP_SEARCH_WORDS:]
+    max_start = min(DEDUP_MAX_LEADING_FILLER_WORDS, len(hyp_norm) - DEDUP_MIN_MATCH_WORDS)
+    best_end = None
+    best_count = 0
+    for hyp_start in range(max_start + 1):
+        final_index = 0
+        matched_positions: List[int] = []
+        for hyp_index in range(hyp_start, len(hyp_norm)):
+            try:
+                found_at = final_tail.index(hyp_norm[hyp_index], final_index)
+            except ValueError:
+                break
+            matched_positions.append(found_at)
+            final_index = found_at + 1
+        if len(matched_positions) < DEDUP_MIN_MATCH_WORDS:
+            continue
+        if matched_positions[-1] != len(final_tail) - 1:
+            continue
+        if len(matched_positions) > best_count:
+            best_count = len(matched_positions)
+            best_end = hyp_start + len(matched_positions)
+    return best_end
 
 
 def append_without_duplicate_overlap(existing: str, addition: str) -> str:

@@ -45,13 +45,12 @@ client_e2e_ms: p50=408.86 p95=416.28
 ```
 
 Experimento `GGML_METAL_MATMUL_N64=1` sobre el hot path `f16 x f32 -> f32`
-del encoder, 5 runs y 1 warmup:
+del encoder. El kernel queda opt-in porque no sostuvo una mejora real frente
+al path normal.
 
 ```text
-encode_ms: p50=260.04 p95=265.41 gate<=70.00 FAIL
-decode_ms: p50=101.85 p95=104.77 gate<=15.00 FAIL
-overhead_ms: p50=17.80 p95=22.99 gate<=15.00 FAIL
-e2e_ms: p50=384.62 p95=391.97 gate<=100.00 FAIL
+normal, 5 runs: encode_ms p50=261.06 p95=279.68; e2e_ms p50=377.89 p95=396.55
+N64,    5 runs: encode_ms p50=288.85 p95=296.77; e2e_ms p50=439.54 p95=460.08
 ```
 
 Transcripcion de verificacion con el kernel experimental:
@@ -108,7 +107,6 @@ git -C /Users/alan/whisper.cpp apply /Users/alan/Documents/Codex/2026-05-14/we-g
 Whisper:
 
 ```sh
-GGML_METAL_MATMUL_N64=1 \
 /Users/alan/whisper.cpp/build-metal-current/bin/whisper-server \
   --host 127.0.0.1 \
   --port 50061 \
@@ -122,8 +120,9 @@ GGML_METAL_MATMUL_N64=1 \
 ```
 
 `GGML_METAL_MATMUL_N64=1` activa el kernel experimental `64x64` para las
-GEMM `f16 x f32 -> f32` alineadas del encoder. Sin ese env var, whisper.cpp
-usa el kernel Metal upstream. Para trazar que kernel toma cada `mul_mat`:
+GEMM `f16 x f32 -> f32` alineadas del encoder. Se mantiene apagado por defecto
+porque en esta maquina fue igual o peor que el kernel Metal upstream. Para
+trazar que kernel toma cada `mul_mat`:
 
 ```sh
 GGML_METAL_MATMUL_DEBUG=1 /Users/alan/whisper.cpp/build-metal-current/bin/whisper-server ...

@@ -433,7 +433,7 @@ index 5fa162c8..7d142de1 100644
  }
 
 diff --git a/ggml/src/ggml-metal/ggml-metal.metal b/ggml/src/ggml-metal/ggml-metal.metal
-index c372eaed..4d71c3a1 100644
+index c372eaed..8d09fa01 100644
 --- a/ggml/src/ggml-metal/ggml-metal.metal
 +++ b/ggml/src/ggml-metal/ggml-metal.metal
 @@ -2983,6 +2983,100 @@ template [[host_name("kernel_norm_f32_4")]]         kernel kernel_norm_fuse_t ke
@@ -537,7 +537,7 @@ index c372eaed..4d71c3a1 100644
  // F == 1 : rms_norm (no fuse)
  // F == 2 : rms_norm + mul
  // F == 3 : rms_norm + mul + add
-@@ -9649,6 +9743,136 @@ kernel void kernel_mul_mm(
+@@ -9649,6 +9743,137 @@ kernel void kernel_mul_mm(
 
  #endif // GGML_METAL_HAS_TENSOR
 
@@ -573,7 +573,8 @@ index c372eaed..4d71c3a1 100644
 +
 +    const short il0 = tiitg % NL0;
 +
-+    const short lr0 = ((short) tiitg) / NL0;
++    const short lr0_raw = ((short) tiitg) / NL0;
++    const short lr0 = lr0_raw < NR0 ? lr0_raw : NR0 - 1;
 +    const short lr1 = ((short) tiitg) / NL1;
 +    const short iy  = 8*(tiitg % NL1);
 +

@@ -9775,7 +9775,8 @@ kernel void kernel_mul_mm_f16_f32_n64(
 
     const short il0 = tiitg % NL0;
 
-    const short lr0 = ((short) tiitg) / NL0;
+    const short lr0_raw = ((short) tiitg) / NL0;
+    const short lr0 = lr0_raw < NR0 ? lr0_raw : NR0 - 1;
     const short lr1 = ((short) tiitg) / NL1;
     const short iy  = 8*(tiitg % NL1);
 

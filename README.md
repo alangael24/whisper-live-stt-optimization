@@ -17,11 +17,11 @@ Ultima medicion registrada:
 {
   "text": "Me llamo Alan y necesito reparar una fuga hoy.",
   "audio_ms": 2828,
-  "since_start_ms": 3556,
-  "after_audio_ms": 486,
-  "inference_ms": 453,
-  "delivery_ms": 485,
-  "rtf": 0.16,
+  "since_start_ms": 3764,
+  "after_audio_ms": 697,
+  "inference_ms": 661,
+  "delivery_ms": 697,
+  "rtf": 0.234,
   "speculative": false
 }
 ```

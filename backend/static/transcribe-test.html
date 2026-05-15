@@ -250,6 +250,8 @@
     let sinkNode = null;
     let liveSocket = null;
     let recording = false;
+    let stopping = false;
+    let stopFallbackTimer = null;
     let sampleRate = 0;
     let pendingSamples = [];
 
@@ -267,15 +269,18 @@
     }
 
     function updateControls() {
-      clearButton.disabled = recording;
+      recordButton.disabled = stopping;
+      clearButton.disabled = recording || stopping;
     }
 
     async function startRecording() {
+      if (stopping) return;
       if (!window.AudioWorkletNode) {
         setError("AudioWorklet no está disponible en este navegador.");
         return;
       }
       setError("");
+      stopping = false;
       pendingSamples = [];
       liveSocket = await connectLiveSocket();
       stream = await navigator.mediaDevices.getUserMedia({
@@ -311,31 +316,48 @@
     function stopRecording() {
       if (!recording) return;
       recording = false;
-      recordButton.textContent = "Iniciar";
+      stopping = true;
+      recordButton.textContent = "Transcribiendo...";
       recordButton.className = "primary";
       flushPendingSamples();
       if (liveSocket && liveSocket.readyState === WebSocket.OPEN) {
         liveSocket.send(JSON.stringify({type: "stop"}));
       }
-      cleanupAudio();
+      cleanupAudio({closeSocket: false});
       levelEl.style.width = "0%";
+      setStatus("transcribiendo", true);
+      stopFallbackTimer = window.setTimeout(() => {
+        if (liveSocket && liveSocket.readyState === WebSocket.OPEN) liveSocket.close();
+        finishStopping();
+      }, 8000);
+      updateControls();
+    }
+
+    function finishStopping() {
+      if (stopFallbackTimer) window.clearTimeout(stopFallbackTimer);
+      stopFallbackTimer = null;
+      stopping = false;
+      recordButton.textContent = "Iniciar";
+      recordButton.className = "primary";
+      liveSocket = null;
       setStatus("listo");
       updateControls();
     }
 
-    function cleanupAudio() {
+    function cleanupAudio(options = {}) {
+      const closeSocket = options.closeSocket !== false;
       if (workletNode) workletNode.disconnect();
       if (sinkNode) sinkNode.disconnect();
       if (source) source.disconnect();
       if (stream) stream.getTracks().forEach(track => track.stop());
       if (audioContext) audioContext.close();
-      if (liveSocket && liveSocket.readyState === WebSocket.OPEN) liveSocket.close();
+      if (closeSocket && liveSocket && liveSocket.readyState === WebSocket.OPEN) liveSocket.close();
       workletNode = null;
       sinkNode = null;
       source = null;
       stream = null;
       audioContext = null;
-      liveSocket = null;
+      if (closeSocket) liveSocket = null;
     }
 
     function connectLiveSocket() {
@@ -346,6 +368,9 @@
         socket.onopen = () => resolve(socket);
         socket.onerror = () => reject(new Error("No pude abrir el WebSocket local."));
         socket.onmessage = (event) => handleLiveEvent(JSON.parse(event.data));
+        socket.onclose = () => {
+          if (stopping && socket === liveSocket) finishStopping();
+        };
       });
     }
 
@@ -459,6 +484,7 @@
     }
 
     recordButton.addEventListener("click", () => {
+      if (stopping) return;
       if (recording) stopRecording();
       else startRecording().catch((error) => {
         setError(error.message);

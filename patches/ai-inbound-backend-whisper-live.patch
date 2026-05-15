@@ -647,10 +647,103 @@ index eab01ee..e1e9e36 100644
 +        return f"{existing} {addition}"
 +    return existing or addition
 diff --git a/static/transcribe-test.html b/static/transcribe-test.html
-index 20e490c..3ca8d5e 100644
+index 20e490c..3d3d571 100644
 --- a/static/transcribe-test.html
 +++ b/static/transcribe-test.html
-@@ -377,7 +377,9 @@
+@@ -250,6 +250,8 @@
+     let sinkNode = null;
+     let liveSocket = null;
+     let recording = false;
++    let stopping = false;
++    let stopFallbackTimer = null;
+     let sampleRate = 0;
+     let pendingSamples = [];
+ 
+@@ -267,15 +269,18 @@
+     }
+ 
+     function updateControls() {
+-      clearButton.disabled = recording;
++      recordButton.disabled = stopping;
++      clearButton.disabled = recording || stopping;
+     }
+ 
+     async function startRecording() {
++      if (stopping) return;
+       if (!window.AudioWorkletNode) {
+         setError("AudioWorklet no está disponible en este navegador.");
+         return;
+       }
+       setError("");
++      stopping = false;
+       pendingSamples = [];
+       liveSocket = await connectLiveSocket();
+       stream = await navigator.mediaDevices.getUserMedia({
+@@ -311,31 +316,48 @@
+     function stopRecording() {
+       if (!recording) return;
+       recording = false;
+-      recordButton.textContent = "Iniciar";
++      stopping = true;
++      recordButton.textContent = "Transcribiendo...";
+       recordButton.className = "primary";
+       flushPendingSamples();
+       if (liveSocket && liveSocket.readyState === WebSocket.OPEN) {
+         liveSocket.send(JSON.stringify({type: "stop"}));
+       }
+-      cleanupAudio();
++      cleanupAudio({closeSocket: false});
+       levelEl.style.width = "0%";
++      setStatus("transcribiendo", true);
++      stopFallbackTimer = window.setTimeout(() => {
++        if (liveSocket && liveSocket.readyState === WebSocket.OPEN) liveSocket.close();
++        finishStopping();
++      }, 8000);
++      updateControls();
++    }
++
++    function finishStopping() {
++      if (stopFallbackTimer) window.clearTimeout(stopFallbackTimer);
++      stopFallbackTimer = null;
++      stopping = false;
++      recordButton.textContent = "Iniciar";
++      recordButton.className = "primary";
++      liveSocket = null;
+       setStatus("listo");
+       updateControls();
+     }
+ 
+-    function cleanupAudio() {
++    function cleanupAudio(options = {}) {
++      const closeSocket = options.closeSocket !== false;
+       if (workletNode) workletNode.disconnect();
+       if (sinkNode) sinkNode.disconnect();
+       if (source) source.disconnect();
+       if (stream) stream.getTracks().forEach(track => track.stop());
+       if (audioContext) audioContext.close();
+-      if (liveSocket && liveSocket.readyState === WebSocket.OPEN) liveSocket.close();
++      if (closeSocket && liveSocket && liveSocket.readyState === WebSocket.OPEN) liveSocket.close();
+       workletNode = null;
+       sinkNode = null;
+       source = null;
+       stream = null;
+       audioContext = null;
+-      liveSocket = null;
++      if (closeSocket) liveSocket = null;
+     }
+ 
+     function connectLiveSocket() {
+@@ -346,6 +368,9 @@
+         socket.onopen = () => resolve(socket);
+         socket.onerror = () => reject(new Error("No pude abrir el WebSocket local."));
+         socket.onmessage = (event) => handleLiveEvent(JSON.parse(event.data));
++        socket.onclose = () => {
++          if (stopping && socket === liveSocket) finishStopping();
++        };
+       });
+     }
+ 
+@@ -377,7 +402,9 @@
        const meta = document.createElement("div");
        meta.className = "meta";
        if (data.final) meta.append(metaPill("final"));
@@ -660,6 +753,14 @@ index 20e490c..3ca8d5e 100644
        meta.append(metaPill(`stt ${data.inference_ms || data.stt_ms || 0}ms`));
        if (data.rtf) meta.append(metaPill(`rtf ${data.rtf}`));
        entry.append(transcript, meta);
+@@ -457,6 +484,7 @@
+     }
+ 
+     recordButton.addEventListener("click", () => {
++      if (stopping) return;
+       if (recording) stopRecording();
+       else startRecording().catch((error) => {
+         setError(error.message);
 diff --git a/tests/test_audio_stt.py b/tests/test_audio_stt.py
 index c070022..27d900f 100644
 --- a/tests/test_audio_stt.py

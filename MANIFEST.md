@@ -11,6 +11,7 @@
 
 - `whisper.cpp/examples/server/server.cpp`
 - `whisper.cpp/ggml/src/ggml-metal/ggml-metal-device.cpp`
+- `whisper.cpp/ggml/src/ggml-metal/ggml-metal-ops.cpp`
 - `whisper.cpp/ggml/src/ggml-metal/ggml-metal.metal`
 - `whisper.cpp/include/whisper.h`
 - `whisper.cpp/src/coreml/whisper-encoder.mm`

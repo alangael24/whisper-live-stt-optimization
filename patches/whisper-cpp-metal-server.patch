@@ -48,7 +48,7 @@ index 08c0988d..2a0dd2d4 100644
 @@ -623,6 +631,54 @@ void get_req_parameters(const Request & req, whisper_params & params)
      }
  }
- 
+
 +void get_query_parameters(const Request & req, whisper_params & params)
 +{
 +    if (req.has_param("offset_t"))               { params.offset_t_ms     = std::stoi(req.get_param_value("offset_t")); }
@@ -98,16 +98,16 @@ index 08c0988d..2a0dd2d4 100644
 +}
 +
  }  // namespace
- 
+
  int main(int argc, char ** argv) {
 @@ -927,6 +983,7 @@ int main(int argc, char ** argv) {
- 
+
              wparams.thold_pt         = params.word_thold;
              wparams.max_len          = params.max_len == 0 ? 60 : params.max_len;
 +            wparams.max_tokens       = params.max_tokens;
              wparams.split_on_word    = params.split_on_word;
              wparams.audio_ctx        = params.audio_ctx;
- 
+
 @@ -1131,6 +1188,188 @@ int main(int argc, char ** argv) {
          // reset params to their defaults
          params = default_params;
@@ -298,10 +298,54 @@ index 08c0988d..2a0dd2d4 100644
          std::lock_guard<std::mutex> lock(whisper_mutex);
          state.store(SERVER_STATE_LOADING_MODEL);
 diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
-index d211bf79..ae008c2c 100644
+index d211bf79..8133e5ba 100644
 --- a/ggml/src/ggml-metal/ggml-metal-device.cpp
 +++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
-@@ -1626,9 +1626,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_norm(ggml_metal_
+@@ -5,6 +5,7 @@
+ #include "ggml-impl.h"
+
+ #include <cassert>
++#include <cstdlib>
+ #include <memory>
+ #include <string>
+ #include <unordered_map>
+@@ -687,6 +688,35 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
+         ? (op->ne[0] % NRA != 0 || op->ne[1] % NRB != 0)
+         : (op->ne[0] % 64  != 0 || op->ne[1] % 32  != 0);
+
++    const bool use_n64 = std::getenv("GGML_METAL_MATMUL_N64") &&
++        !has_tensor &&
++        tsrc0 == GGML_TYPE_F16 &&
++        tsrc1 == GGML_TYPE_F32 &&
++        !bc_inp &&
++        op->ne[0] % 64 == 0 &&
++        op->ne[1] % 64 == 0;
++
++    if (use_n64) {
++        snprintf(base, 256, "kernel_mul_mm_f16_f32_n64");
++        snprintf(name, 256, "%s", base);
++
++        ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
++        if (!res.pipeline) {
++            ggml_metal_cv_t cv = ggml_metal_cv_init();
++
++            res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
++
++            ggml_metal_cv_free(cv);
++        }
++
++        res.nr0 = 64;
++        res.nr1 = 64;
++        res.smem = 4096 + 4096;
++        res.nsg = 8;
++
++        return res;
++    }
++
+     snprintf(base, 256, "kernel_mul_mm_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
+     snprintf(name, 256, "%s_bci=%d_bco=%d", base, bc_inp, bc_out);
+
+@@ -1626,9 +1656,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_norm(ggml_metal_
      switch (op->op) {
          case GGML_OP_NORM:
              switch (n_fuse) {
@@ -314,14 +358,88 @@ index d211bf79..ae008c2c 100644
                  default: GGML_ABORT("fatal error");
              } break;
          case GGML_OP_RMS_NORM:
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index 5fa162c8..7d142de1 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -10,6 +10,7 @@
+
+ #include <cassert>
+ #include <algorithm>
++#include <cstdlib>
+ #include <limits>
+ #include <cmath>
+
+@@ -2045,6 +2046,9 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
+     const int16_t r2 = ne12/ne02;
+     const int16_t r3 = ne13/ne03;
+
++    static const bool debug_matmul = getenv("GGML_METAL_MATMUL_DEBUG") != nullptr;
++    const char * selected_kernel = "mul_mv";
++
+     // find the break-even point where the matrix-matrix kernel becomes more efficient compared
+     // to the matrix-vector kernel
+     const int ne11_mm_min = 8;
+@@ -2079,6 +2083,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
+          )
+         )
+        ) {
++        selected_kernel = "mul_mv_ext";
+         // TODO: determine the optimal parameters based on grid utilization
+         //       I still don't know why we should not always use the maximum available threads:
+         //
+@@ -2156,6 +2161,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
+         // for now the matrix-matrix multiplication kernel only works on A14+/M1+ SoCs
+         // AMD GPU and older A-chips will reuse matrix-vector multiplication kernel
+         props_dev->has_simdgroup_mm && ne00 >= 64 && ne11 > ne11_mm_min) {
++        selected_kernel = "mul_mm";
+         //GGML_LOG_INFO("matrix: ne00 = %6d, ne01 = %6d, ne02 = %6d, ne11 = %6d, ne12 = %6d\n", ne00, ne01, ne02, ne11, ne12);
+
+         // some Metal matrix data types require aligned pointers
+@@ -2168,6 +2174,9 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
+         //}
+
+         auto pipeline = ggml_metal_library_get_pipeline_mul_mm(lib, op);
++        if (pipeline.nr1 == 64 && pipeline.nsg == 8) {
++            selected_kernel = "mul_mm_n64";
++        }
+
+         ggml_metal_kargs_mul_mm args = {
+             /*.ne00 =*/ ne00,
+@@ -2202,6 +2211,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
+
+         ggml_metal_encoder_dispatch_threadgroups(enc, ((ne11 + nr1 - 1) / nr1), ((ne01 + nr0 - 1) / nr0), ne12 * ne13, 32, nsg, 1);
+     } else {
++        selected_kernel = "mul_mv";
+         auto pipeline = ggml_metal_library_get_pipeline_mul_mv(lib, op);
+
+         const int nr0 = pipeline.nr0;
+@@ -2250,6 +2260,17 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
+         }
+     }
+
++    if (debug_matmul) {
++        GGML_LOG_INFO(
++            "%s: node=%s kernel=%s src0=%s[%d,%d,%d,%d] src1=%s[%d,%d,%d,%d] dst=%s[%d,%d,%d,%d]\n",
++            __func__,
++            ggml_get_name(op),
++            selected_kernel,
++            ggml_type_name(op->src[0]->type), ne00, ne01, ne02, ne03,
++            ggml_type_name(op->src[1]->type), ne10, ne11, ne12, ne13,
++            ggml_type_name(op->type), ne0, ne1, ne2, ne3);
++    }
++
+     return 1;
+ }
+
 diff --git a/ggml/src/ggml-metal/ggml-metal.metal b/ggml/src/ggml-metal/ggml-metal.metal
-index c372eaed..1637e3b9 100644
+index c372eaed..4d71c3a1 100644
 --- a/ggml/src/ggml-metal/ggml-metal.metal
 +++ b/ggml/src/ggml-metal/ggml-metal.metal
 @@ -2983,6 +2983,100 @@ template [[host_name("kernel_norm_f32_4")]]         kernel kernel_norm_fuse_t ke
  template [[host_name("kernel_norm_mul_f32_4")]]     kernel kernel_norm_fuse_t kernel_norm_fuse_impl<float4, 2>;
  template [[host_name("kernel_norm_mul_add_f32_4")]] kernel kernel_norm_fuse_t kernel_norm_fuse_impl<float4, 3>;
- 
+
 +// Whisper large-v3-turbo decoder layer norm route. The body intentionally
 +// matches ggml's validated vectorized norm kernel while giving the 1280-wide
 +// decoder path a distinct Metal entrypoint for targeted profiling/tuning.
@@ -419,6 +537,143 @@ index c372eaed..1637e3b9 100644
  // F == 1 : rms_norm (no fuse)
  // F == 2 : rms_norm + mul
  // F == 3 : rms_norm + mul + add
+@@ -9649,6 +9743,136 @@ kernel void kernel_mul_mm(
+
+ #endif // GGML_METAL_HAS_TENSOR
+
++#ifndef GGML_METAL_HAS_TENSOR
++
++kernel void kernel_mul_mm_f16_f32_n64(
++        constant ggml_metal_kargs_mul_mm & args,
++        device const char * src0,
++        device const char * src1,
++        device       char * dst,
++        threadgroup  char * shmem [[threadgroup(0)]],
++        uint3  tgpig[[threadgroup_position_in_grid]],
++        ushort tiitg[[thread_index_in_threadgroup]],
++        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
++
++    threadgroup half * sa = (threadgroup half *)(shmem);
++    threadgroup half * sb = (threadgroup half *)(shmem + 4096);
++
++    constexpr int NR0 = 64;
++    constexpr int NR1 = 64;
++    constexpr int NK  = 32;
++    constexpr int NL0 = NK/16;
++    constexpr int NL1 = NK/8;
++
++    const int im = tgpig.z;
++    const int r0 = tgpig.y*NR0;
++    const int r1 = tgpig.x*NR1;
++
++    const int i12 = im%args.ne12;
++    const int i13 = im/args.ne12;
++
++    const uint64_t offset0 = (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
++
++    const short il0 = tiitg % NL0;
++
++    const short lr0 = ((short) tiitg) / NL0;
++    const short lr1 = ((short) tiitg) / NL1;
++    const short iy  = 8*(tiitg % NL1);
++
++    device const half4x4 * x = (device const half4x4 *)(src0 + args.nb01*(r0 + lr0) + offset0) + il0;
++    device const float   * y = (device const float *)(src1
++        + args.nb13*i13
++        + args.nb12*i12
++        + args.nb11*(r1 + lr1)
++        + args.nb10*iy);
++
++    simdgroup_half8x8 ma[4];
++    simdgroup_half8x8 mb[2];
++
++    simdgroup_float8x8 mc[8];
++
++    for (short i = 0; i < 8; i++) {
++        mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
++    }
++
++    for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
++        half4x4 temp_a;
++        if (tiitg < NR0*NL0) {
++            temp_a = *((device half4x4 *) x);
++        }
++
++        const float2x4 temp_b = *((device float2x4 *) y);
++
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++
++        if (tiitg < NR0*NL0) {
++            FOR_UNROLL (short i = 0; i < 16; i++) {
++                const short sx = 2*il0 + i/8;
++                const short sy = (tiitg/NL0)/8;
++
++                const short lx = (tiitg/NL0)%8;
++                const short ly = i%8;
++
++                const short ib = 8*sx + sy;
++
++                *(sa + 64*ib + 8*ly + lx) = temp_a[i/4][i%4];
++            }
++        }
++
++        {
++            const short sx = tiitg%NL1;
++            const short sy = (tiitg/NL1)/8;
++
++            const short ly = (tiitg/NL1)%8;
++
++            const short ib = 8*sx + sy;
++
++            *(threadgroup half2x4 *)(sb + 64*ib + 8*ly) = (half2x4) temp_b;
++        }
++
++        x += 2;
++        y += NK;
++
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++
++        threadgroup const half * lsma = (sa + 4*64*(sgitg%2));
++        threadgroup const half * lsmb = (sb + 2*64*(sgitg/2));
++
++        FOR_UNROLL (short ik = 0; ik < NK/8; ik++) {
++            simdgroup_barrier(mem_flags::mem_none);
++
++            FOR_UNROLL (short i = 0; i < 4; i++) {
++                simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
++            }
++
++            simdgroup_barrier(mem_flags::mem_none);
++
++            FOR_UNROLL (short i = 0; i < 2; i++) {
++                simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false);
++            }
++
++            simdgroup_barrier(mem_flags::mem_none);
++
++            FOR_UNROLL (short i = 0; i < 8; i++) {
++                simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]);
++            }
++
++            lsma += 8*64;
++            lsmb += 8*64;
++        }
++    }
++
++    device float * C = (device float *) dst +
++        (r0 + 32*(sgitg &  1)) +
++        (r1 + 16*(sgitg >> 1)) * args.ne0 + im*args.ne1*args.ne0;
++
++    for (short i = 0; i < 8; i++) {
++        simdgroup_store(mc[i], C + 8*(i%4) + 8*args.ne0*(i/4), args.ne0, 0, false);
++    }
++}
++
++#endif // GGML_METAL_HAS_TENSOR
++
+ template<short ne20> // n_expert_used
+ kernel void kernel_mul_mm_id_map0(
+         constant ggml_metal_kargs_mul_mm_id_map0 & args,
 diff --git a/include/whisper.h b/include/whisper.h
 index b5dcdb29..b79b428e 100644
 --- a/include/whisper.h
@@ -443,28 +698,28 @@ index 81a5a6aa..718c0a9a 100644
 +++ b/src/coreml/whisper-encoder.mm
 @@ -3,20 +3,47 @@
  #endif
- 
+
  #import "whisper-encoder.h"
 -#import "whisper-encoder-impl.h"
- 
+
  #import <CoreML/CoreML.h>
- 
+
 +#include <string.h>
  #include <stdlib.h>
 +#include <algorithm>
 +#include <vector>
- 
+
  #if __cplusplus
  extern "C" {
  #endif
- 
+
  struct whisper_coreml_context {
 -    const void * data;
 +    MLModel  * model;
 +    NSString * input_name;
 +    NSString * output_name;
  };
- 
+
 +static uint16_t whisper_f32_to_f16_bits(float value) {
 +    __fp16 half = (__fp16) value;
 +    uint16_t bits;
@@ -490,23 +745,23 @@ index 81a5a6aa..718c0a9a 100644
 +
  struct whisper_coreml_context * whisper_coreml_init(const char * path_model) {
      NSString * path_model_str = [[NSString alloc] initWithUTF8String:path_model];
- 
+
 @@ -28,21 +55,38 @@
      //config.computeUnits = MLComputeUnitsCPUAndNeuralEngine;
      config.computeUnits = MLComputeUnitsAll;
- 
+
 -    const void * data = CFBridgingRetain([[whisper_encoder_impl alloc] initWithContentsOfURL:url_model configuration:config error:nil]);
 +    NSError * error = nil;
 +    MLModel * model = [MLModel modelWithContentsOfURL:url_model configuration:config error:&error];
- 
+
 -    if (data == NULL) {
 +    if (model == nil) {
 +        NSLog(@"whisper.cpp CoreML: failed to load model at %@: %@", path_model_str, error);
          return NULL;
      }
- 
+
      whisper_coreml_context * ctx = new whisper_coreml_context;
- 
+
 -    ctx->data = data;
 +    ctx->model = model;
 +    ctx->input_name = whisper_coreml_pick_feature_name(
@@ -525,15 +780,15 @@ index 81a5a6aa..718c0a9a 100644
 +    }
 +
 +    NSLog(@"whisper.cpp CoreML: input=%@ output=%@", ctx->input_name, ctx->output_name);
- 
+
      return ctx;
  }
- 
+
  void whisper_coreml_free(struct whisper_coreml_context * ctx) {
 -    CFRelease(ctx->data);
      delete ctx;
  }
- 
+
 @@ -52,19 +96,151 @@ void whisper_coreml_encode(
                               int64_t   n_mel,
                                 float * mel,
@@ -697,12 +952,87 @@ index 81a5a6aa..718c0a9a 100644
 +        }
      }
  }
- 
+
 diff --git a/src/whisper.cpp b/src/whisper.cpp
-index 6176d21f..7aa34db4 100644
+index 6176d21f..af4132b8 100644
 --- a/src/whisper.cpp
 +++ b/src/whisper.cpp
-@@ -4246,12 +4246,20 @@ struct whisper_timings * whisper_get_timings(struct whisper_context * ctx) {
+@@ -2113,6 +2113,7 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
+             struct ggml_tensor * Qcur = ggml_mul_mat(ctx0,
+                     layer.attn_q_w,
+                     cur);
++            ggml_format_name(Qcur, "enc.%02d.attn.q", il);
+
+             Qcur = ggml_add(ctx0, Qcur, layer.attn_q_b);
+
+@@ -2122,12 +2123,14 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
+             struct ggml_tensor * Kcur = ggml_mul_mat(ctx0,
+                     layer.attn_k_w,
+                     cur);
++            ggml_format_name(Kcur, "enc.%02d.attn.k", il);
+
+             //Kcur = ggml_scale(ctx0, Kcur, pow(float(n_state_head), -0.25));
+
+             struct ggml_tensor * Vcur = ggml_mul_mat(ctx0,
+                     layer.attn_v_w,
+                     cur);
++            ggml_format_name(Vcur, "enc.%02d.attn.v", il);
+
+             Vcur = ggml_add(ctx0, Vcur, layer.attn_v_b);
+
+@@ -2157,6 +2160,7 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
+                             0);
+
+                 cur = ggml_flash_attn_ext(ctx0, Q, K, V, nullptr, KQscale, 0.0f, 0.0f);
++                ggml_format_name(cur, "enc.%02d.attn.flash", il);
+
+                 cur = ggml_reshape_2d(ctx0, cur, n_state, n_ctx);
+             } else {
+@@ -2169,6 +2173,7 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
+
+                 // K * Q
+                 struct ggml_tensor * KQ = ggml_mul_mat(ctx0, K, Q);
++                ggml_format_name(KQ, "enc.%02d.attn.kq", il);
+
+                 struct ggml_tensor * KQ_soft_max = ggml_soft_max_ext(ctx0, KQ, nullptr, KQscale, 0.0f);
+
+@@ -2182,6 +2187,7 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
+                             wctx.itype);
+
+                 struct ggml_tensor * KQV = ggml_mul_mat(ctx0, V, KQ_soft_max);
++                ggml_format_name(KQV, "enc.%02d.attn.kqv", il);
+
+                 struct ggml_tensor * KQV_merged = ggml_permute(ctx0, KQV, 0, 2, 1, 3);
+
+@@ -2194,6 +2200,7 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
+             cur = ggml_mul_mat(ctx0,
+                     layer.attn_ln_1_w,
+                     cur);
++            ggml_format_name(cur, "enc.%02d.attn.out", il);
+
+             cur = ggml_add(ctx0, cur, layer.attn_ln_1_b);
+         }
+@@ -2219,16 +2226,19 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
+             cur = ggml_mul_mat(ctx0,
+                     layer.mlp_0_w,
+                     cur);
++            ggml_format_name(cur, "enc.%02d.ffn.up", il);
+
+             cur = ggml_add(ctx0, cur, layer.mlp_0_b);
+
+             // GELU activation
+             cur = ggml_gelu(ctx0, cur);
++            ggml_format_name(cur, "enc.%02d.ffn.gelu", il);
+
+             // projection
+             cur = ggml_mul_mat(ctx0,
+                     layer.mlp_1_w,
+                     cur);
++            ggml_format_name(cur, "enc.%02d.ffn.down", il);
+
+             cur = ggml_add(ctx0, cur, layer.mlp_1_b);
+         }
+@@ -4246,12 +4256,20 @@ struct whisper_timings * whisper_get_timings(struct whisper_context * ctx) {
      if (ctx->state == nullptr) {
          return nullptr;
      }
@@ -722,4 +1052,4 @@ index 6176d21f..7aa34db4 100644
 +    timings->total_ms = 1e-3f * (t_end_us - ctx->t_start_us);
      return timings;
  }
- 
+

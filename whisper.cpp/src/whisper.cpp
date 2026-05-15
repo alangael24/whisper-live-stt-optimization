@@ -2113,6 +2113,7 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
             struct ggml_tensor * Qcur = ggml_mul_mat(ctx0,
                     layer.attn_q_w,
                     cur);
+            ggml_format_name(Qcur, "enc.%02d.attn.q", il);
 
             Qcur = ggml_add(ctx0, Qcur, layer.attn_q_b);
 
@@ -2122,12 +2123,14 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
             struct ggml_tensor * Kcur = ggml_mul_mat(ctx0,
                     layer.attn_k_w,
                     cur);
+            ggml_format_name(Kcur, "enc.%02d.attn.k", il);
 
             //Kcur = ggml_scale(ctx0, Kcur, pow(float(n_state_head), -0.25));
 
             struct ggml_tensor * Vcur = ggml_mul_mat(ctx0,
                     layer.attn_v_w,
                     cur);
+            ggml_format_name(Vcur, "enc.%02d.attn.v", il);
 
             Vcur = ggml_add(ctx0, Vcur, layer.attn_v_b);
 
@@ -2157,6 +2160,7 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
                             0);
 
                 cur = ggml_flash_attn_ext(ctx0, Q, K, V, nullptr, KQscale, 0.0f, 0.0f);
+                ggml_format_name(cur, "enc.%02d.attn.flash", il);
 
                 cur = ggml_reshape_2d(ctx0, cur, n_state, n_ctx);
             } else {
@@ -2169,6 +2173,7 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
 
                 // K * Q
                 struct ggml_tensor * KQ = ggml_mul_mat(ctx0, K, Q);
+                ggml_format_name(KQ, "enc.%02d.attn.kq", il);
 
                 struct ggml_tensor * KQ_soft_max = ggml_soft_max_ext(ctx0, KQ, nullptr, KQscale, 0.0f);
 
@@ -2182,6 +2187,7 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
                             wctx.itype);
 
                 struct ggml_tensor * KQV = ggml_mul_mat(ctx0, V, KQ_soft_max);
+                ggml_format_name(KQV, "enc.%02d.attn.kqv", il);
 
                 struct ggml_tensor * KQV_merged = ggml_permute(ctx0, KQV, 0, 2, 1, 3);
 
@@ -2194,6 +2200,7 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
             cur = ggml_mul_mat(ctx0,
                     layer.attn_ln_1_w,
                     cur);
+            ggml_format_name(cur, "enc.%02d.attn.out", il);
 
             cur = ggml_add(ctx0, cur, layer.attn_ln_1_b);
         }
@@ -2219,16 +2226,19 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
             cur = ggml_mul_mat(ctx0,
                     layer.mlp_0_w,
                     cur);
+            ggml_format_name(cur, "enc.%02d.ffn.up", il);
 
             cur = ggml_add(ctx0, cur, layer.mlp_0_b);
 
             // GELU activation
             cur = ggml_gelu(ctx0, cur);
+            ggml_format_name(cur, "enc.%02d.ffn.gelu", il);
 
             // projection
             cur = ggml_mul_mat(ctx0,
                     layer.mlp_1_w,
                     cur);
+            ggml_format_name(cur, "enc.%02d.ffn.down", il);
 
             cur = ggml_add(ctx0, cur, layer.mlp_1_b);
         }

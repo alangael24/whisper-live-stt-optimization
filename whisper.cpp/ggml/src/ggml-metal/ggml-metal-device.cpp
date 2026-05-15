@@ -5,6 +5,7 @@
 #include "ggml-impl.h"
 
 #include <cassert>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -686,6 +687,35 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     const bool bc_out = has_tensor
         ? (op->ne[0] % NRA != 0 || op->ne[1] % NRB != 0)
         : (op->ne[0] % 64  != 0 || op->ne[1] % 32  != 0);
+
+    const bool use_n64 = std::getenv("GGML_METAL_MATMUL_N64") &&
+        !has_tensor &&
+        tsrc0 == GGML_TYPE_F16 &&
+        tsrc1 == GGML_TYPE_F32 &&
+        !bc_inp &&
+        op->ne[0] % 64 == 0 &&
+        op->ne[1] % 64 == 0;
+
+    if (use_n64) {
+        snprintf(base, 256, "kernel_mul_mm_f16_f32_n64");
+        snprintf(name, 256, "%s", base);
+
+        ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+        if (!res.pipeline) {
+            ggml_metal_cv_t cv = ggml_metal_cv_init();
+
+            res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+
+            ggml_metal_cv_free(cv);
+        }
+
+        res.nr0 = 64;
+        res.nr1 = 64;
+        res.smem = 4096 + 4096;
+        res.nsg = 8;
+
+        return res;
+    }
 
     snprintf(base, 256, "kernel_mul_mm_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
     snprintf(name, 256, "%s_bci=%d_bco=%d", base, bc_inp, bc_out);

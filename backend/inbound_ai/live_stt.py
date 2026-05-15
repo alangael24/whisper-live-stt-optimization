@@ -21,7 +21,8 @@ from .config import Settings
 SAMPLE_RATE = 16_000
 BYTES_PER_SAMPLE = 2
 STEP_SECONDS = 0.1
-MIN_WINDOW_SECONDS = 1.2
+MIN_WINDOW_SECONDS = 0.65
+MIN_FORCED_WINDOW_SECONDS = 0.25
 SPEECH_RMS_THRESHOLD = 260
 SILENCE_FINALIZE_SECONDS = 0.3
 PRE_ROLL_SECONDS = 0.25
@@ -78,7 +79,12 @@ class PcmRingBuffer:
                 if len(self.utterance) > self.utterance_capacity:
                     del self.utterance[: len(self.utterance) - self.utterance_capacity]
 
-    def extract_utterance_if_ready(self, silence_seconds: float, force: bool = False) -> bytes:
+    def extract_utterance_if_ready(
+        self,
+        silence_seconds: float,
+        force: bool = False,
+        min_bytes: int = 0,
+    ) -> bytes:
         with self.lock:
             if not self.in_speech or not self.utterance:
                 return b""
@@ -86,6 +92,8 @@ class PcmRingBuffer:
                 if not self.last_speech_at:
                     return b""
                 if time.monotonic() - self.last_speech_at < silence_seconds:
+                    return b""
+                if len(self.utterance) < min_bytes:
                     return b""
             utterance = bytes(self.utterance)
             self.utterance = bytearray()
@@ -187,7 +195,7 @@ class LiveSttBridge:
                 force=True,
             )
             if utterance:
-                self._transcribe_final_utterance(utterance)
+                self._transcribe_final_utterance(utterance, allow_short=True)
             self.closed.set()
         if event.get("type") == "reset":
             self.state = TranscriptState()
@@ -200,13 +208,17 @@ class LiveSttBridge:
             self._maybe_finalize_on_silence()
 
     def _maybe_finalize_on_silence(self) -> None:
-        utterance = self.ring.extract_utterance_if_ready(SILENCE_FINALIZE_SECONDS)
+        utterance = self.ring.extract_utterance_if_ready(
+            SILENCE_FINALIZE_SECONDS,
+            min_bytes=int(MIN_WINDOW_SECONDS * SAMPLE_RATE * BYTES_PER_SAMPLE),
+        )
         if not utterance:
             return
         self._transcribe_final_utterance(utterance)
 
-    def _transcribe_final_utterance(self, pcm: bytes) -> None:
-        if len(pcm) < int(MIN_WINDOW_SECONDS * SAMPLE_RATE * BYTES_PER_SAMPLE):
+    def _transcribe_final_utterance(self, pcm: bytes, allow_short: bool = False) -> None:
+        min_seconds = MIN_FORCED_WINDOW_SECONDS if allow_short else MIN_WINDOW_SECONDS
+        if len(pcm) < int(min_seconds * SAMPLE_RATE * BYTES_PER_SAMPLE):
             return
         delivery_started = time.perf_counter()
         trimmed = trim_pcm_for_stt(pcm)

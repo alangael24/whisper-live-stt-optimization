@@ -161,7 +161,7 @@ index 4daf08f..4783c97 100644
      boundary: str,
      fields: Dict[str, str],
 diff --git a/inbound_ai/live_stt.py b/inbound_ai/live_stt.py
-index eab01ee..e1e9e36 100644
+index eab01ee..37c6b5f 100644
 --- a/inbound_ai/live_stt.py
 +++ b/inbound_ai/live_stt.py
 @@ -8,10 +8,11 @@ import re
@@ -177,14 +177,15 @@ index eab01ee..e1e9e36 100644
  
  from .audio_stt import transcribe_audio
  from .config import Settings
-@@ -19,12 +20,23 @@ from .config import Settings
+@@ -19,12 +20,24 @@ from .config import Settings
  
  SAMPLE_RATE = 16_000
  BYTES_PER_SAMPLE = 2
 -STEP_SECONDS = 0.8
 -MIN_WINDOW_SECONDS = 2.5
 +STEP_SECONDS = 0.1
-+MIN_WINDOW_SECONDS = 1.2
++MIN_WINDOW_SECONDS = 0.65
++MIN_FORCED_WINDOW_SECONDS = 0.25
  SPEECH_RMS_THRESHOLD = 260
 -SILENCE_FINALIZE_SECONDS = 0.9
 -PRE_ROLL_SECONDS = 0.45
@@ -205,7 +206,7 @@ index eab01ee..e1e9e36 100644
  
  
  class PcmRingBuffer:
-@@ -55,7 +67,8 @@ class PcmRingBuffer:
+@@ -55,7 +68,8 @@ class PcmRingBuffer:
                  if not self.in_speech:
                      self.utterance = bytearray(self.pre_roll)
                      self.in_speech = True
@@ -215,8 +216,26 @@ index eab01ee..e1e9e36 100644
                  if len(self.utterance) > self.utterance_capacity:
                      del self.utterance[: len(self.utterance) - self.utterance_capacity]
                  self.last_speech_at = now
-@@ -76,19 +89,52 @@ class PcmRingBuffer:
+@@ -65,7 +79,12 @@ class PcmRingBuffer:
+                 if len(self.utterance) > self.utterance_capacity:
+                     del self.utterance[: len(self.utterance) - self.utterance_capacity]
+ 
+-    def extract_utterance_if_ready(self, silence_seconds: float, force: bool = False) -> bytes:
++    def extract_utterance_if_ready(
++        self,
++        silence_seconds: float,
++        force: bool = False,
++        min_bytes: int = 0,
++    ) -> bytes:
+         with self.lock:
+             if not self.in_speech or not self.utterance:
+                 return b""
+@@ -74,21 +93,56 @@ class PcmRingBuffer:
                      return b""
+                 if time.monotonic() - self.last_speech_at < silence_seconds:
+                     return b""
++                if len(self.utterance) < min_bytes:
++                    return b""
              utterance = bytes(self.utterance)
              self.utterance = bytearray()
 +            self.pre_roll = bytearray()
@@ -270,7 +289,7 @@ index eab01ee..e1e9e36 100644
  
  
  class LiveSttBridge:
-@@ -99,6 +145,12 @@ class LiveSttBridge:
+@@ -99,6 +153,12 @@ class LiveSttBridge:
          self.state = TranscriptState()
          self.closed = threading.Event()
          self.started_at = time.monotonic()
@@ -283,7 +302,12 @@ index eab01ee..e1e9e36 100644
  
      def run(self) -> None:
          worker = threading.Thread(target=self._infer_loop, name="live-stt", daemon=True)
-@@ -139,10 +191,12 @@ class LiveSttBridge:
+@@ -135,26 +195,193 @@ class LiveSttBridge:
+                 force=True,
+             )
+             if utterance:
+-                self._transcribe_final_utterance(utterance)
++                self._transcribe_final_utterance(utterance, allow_short=True)
              self.closed.set()
          if event.get("type") == "reset":
              self.state = TranscriptState()
@@ -296,11 +320,20 @@ index eab01ee..e1e9e36 100644
              self._maybe_finalize_on_silence()
  
      def _maybe_finalize_on_silence(self) -> None:
-@@ -154,7 +208,168 @@ class LiveSttBridge:
-     def _transcribe_final_utterance(self, pcm: bytes) -> None:
-         if len(pcm) < int(MIN_WINDOW_SECONDS * SAMPLE_RATE * BYTES_PER_SAMPLE):
+-        utterance = self.ring.extract_utterance_if_ready(SILENCE_FINALIZE_SECONDS)
++        utterance = self.ring.extract_utterance_if_ready(
++            SILENCE_FINALIZE_SECONDS,
++            min_bytes=int(MIN_WINDOW_SECONDS * SAMPLE_RATE * BYTES_PER_SAMPLE),
++        )
+         if not utterance:
              return
--        audio_file = self._write_temp_wav(pcm, "final-stt-")
+         self._transcribe_final_utterance(utterance)
+ 
+-    def _transcribe_final_utterance(self, pcm: bytes) -> None:
++    def _transcribe_final_utterance(self, pcm: bytes, allow_short: bool = False) -> None:
++        min_seconds = MIN_FORCED_WINDOW_SECONDS if allow_short else MIN_WINDOW_SECONDS
++        if len(pcm) < int(min_seconds * SAMPLE_RATE * BYTES_PER_SAMPLE):
++            return
 +        delivery_started = time.perf_counter()
 +        trimmed = trim_pcm_for_stt(pcm)
 +        speculative = self._wait_for_matching_speculative_result(
@@ -367,8 +400,9 @@ index eab01ee..e1e9e36 100644
 +        if not SPECULATIVE_ENABLED:
 +            return
 +        pcm = self.ring.snapshot_utterance()
-+        if len(pcm) < int(MIN_WINDOW_SECONDS * SAMPLE_RATE * BYTES_PER_SAMPLE):
-+            return
+         if len(pcm) < int(MIN_WINDOW_SECONDS * SAMPLE_RATE * BYTES_PER_SAMPLE):
+             return
+-        audio_file = self._write_temp_wav(pcm, "final-stt-")
 +
 +        now = time.monotonic()
 +        min_new_bytes = int(
@@ -466,7 +500,7 @@ index eab01ee..e1e9e36 100644
          try:
              started = time.perf_counter()
              result = transcribe_audio(
-@@ -171,25 +386,14 @@ class LiveSttBridge:
+@@ -171,25 +398,14 @@ class LiveSttBridge:
              except OSError:
                  pass
  
@@ -500,7 +534,7 @@ index eab01ee..e1e9e36 100644
          )
  
      def _write_temp_wav(self, pcm: bytes, prefix: str) -> str:
-@@ -225,12 +429,49 @@ def pcm_rms(payload: bytes) -> float:
+@@ -225,12 +441,49 @@ def pcm_rms(payload: bytes) -> float:
      return math.sqrt(total / max(1, count))
  
  
@@ -551,7 +585,7 @@ index eab01ee..e1e9e36 100644
  
  
  def remove_confirmed_overlap(hypothesis: str, final_text: str) -> str:
-@@ -240,17 +481,76 @@ def remove_confirmed_overlap(hypothesis: str, final_text: str) -> str:
+@@ -240,17 +493,76 @@ def remove_confirmed_overlap(hypothesis: str, final_text: str) -> str:
          return " ".join(hyp_words)
      hyp_norm = normalized_words(hypothesis)
      final_norm = normalized_words(final_text)
@@ -630,7 +664,7 @@ index eab01ee..e1e9e36 100644
      if not existing.strip():
          return addition
      existing_words = word_list(existing)
-@@ -260,5 +560,13 @@ def append_without_duplicate_overlap(existing: str, addition: str) -> str:
+@@ -260,5 +572,13 @@ def append_without_duplicate_overlap(existing: str, addition: str) -> str:
      max_overlap = min(len(existing_norm), len(addition_norm), 30)
      for size in range(max_overlap, 0, -1):
          if existing_norm[-size:] == addition_norm[:size]:
@@ -762,7 +796,7 @@ index 20e490c..3d3d571 100644
        else startRecording().catch((error) => {
          setError(error.message);
 diff --git a/tests/test_audio_stt.py b/tests/test_audio_stt.py
-index c070022..27d900f 100644
+index c070022..d90a794 100644
 --- a/tests/test_audio_stt.py
 +++ b/tests/test_audio_stt.py
 @@ -1,13 +1,16 @@
@@ -783,7 +817,7 @@ index c070022..27d900f 100644
  
  
  class AudioSttTests(unittest.TestCase):
-@@ -26,11 +29,145 @@ class AudioSttTests(unittest.TestCase):
+@@ -26,11 +29,172 @@ class AudioSttTests(unittest.TestCase):
          self.assertFalse(result.configured)
          self.assertEqual(result.transcript, "")
  
@@ -874,6 +908,33 @@ index c070022..27d900f 100644
 +
 +        self.assertEqual(utterance, silence + first_speech)
 +        self.assertEqual(ring.snapshot_utterance(), next_speech)
++
++    def test_live_ring_keeps_short_window_until_more_audio(self):
++        ring = PcmRingBuffer(SAMPLE_RATE)
++        speech = (1000).to_bytes(2, "little", signed=True) * 800
++
++        ring.append(speech)
++        utterance = ring.extract_utterance_if_ready(
++            0,
++            min_bytes=len(speech) + 1,
++        )
++
++        self.assertEqual(utterance, b"")
++        self.assertEqual(ring.snapshot_utterance(), speech)
++
++    def test_live_ring_force_extracts_short_window(self):
++        ring = PcmRingBuffer(SAMPLE_RATE)
++        speech = (1000).to_bytes(2, "little", signed=True) * 800
++
++        ring.append(speech)
++        utterance = ring.extract_utterance_if_ready(
++            0,
++            force=True,
++            min_bytes=len(speech) + 1,
++        )
++
++        self.assertEqual(utterance, speech)
++        self.assertEqual(ring.snapshot_utterance(), b"")
 +
 +    def test_live_state_dedupes_accented_overlap(self):
 +        state = TranscriptState()

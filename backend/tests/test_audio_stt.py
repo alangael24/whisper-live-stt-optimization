@@ -117,6 +117,33 @@ class AudioSttTests(unittest.TestCase):
         self.assertEqual(utterance, silence + first_speech)
         self.assertEqual(ring.snapshot_utterance(), next_speech)
 
+    def test_live_ring_keeps_short_window_until_more_audio(self):
+        ring = PcmRingBuffer(SAMPLE_RATE)
+        speech = (1000).to_bytes(2, "little", signed=True) * 800
+
+        ring.append(speech)
+        utterance = ring.extract_utterance_if_ready(
+            0,
+            min_bytes=len(speech) + 1,
+        )
+
+        self.assertEqual(utterance, b"")
+        self.assertEqual(ring.snapshot_utterance(), speech)
+
+    def test_live_ring_force_extracts_short_window(self):
+        ring = PcmRingBuffer(SAMPLE_RATE)
+        speech = (1000).to_bytes(2, "little", signed=True) * 800
+
+        ring.append(speech)
+        utterance = ring.extract_utterance_if_ready(
+            0,
+            force=True,
+            min_bytes=len(speech) + 1,
+        )
+
+        self.assertEqual(utterance, speech)
+        self.assertEqual(ring.snapshot_utterance(), b"")
+
     def test_live_state_dedupes_accented_overlap(self):
         state = TranscriptState()
         state.commit_final("Me llamo Alan")
